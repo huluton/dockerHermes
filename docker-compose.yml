@@ -1,0 +1,355 @@
+# Hermes 自我進化 Agent —— 完整 stack。
+#
+# 兩層網路：
+#
+#   hermes-net（應用層）
+#     hermes-runtime  ◄──►  hermes-controller  ◄──►  hermes-sandbox（動態建立）
+#            │                      │
+#            └──► camofox           │
+#                                   ▼
+#   docker-control-net（internal: true，對外完全隔離）
+#                          docker-socket-proxy ──► /var/run/docker.sock
+#
+# 快速開始：
+#     cp .env.example .env
+#     $EDITOR .env                 # 至少要填 HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
+#     docker compose build
+#     docker compose up -d
+#
+# 要開第二套獨立的 agent：複製整個目錄，改 .env 裡的 INSTANCE 與所有埠號。
+# 所有容器、卷、網路的名稱都由 INSTANCE 推導，兩套之間不會互相干擾。
+
+# 專案名稱由 INSTANCE 推導，不另外要求設定 COMPOSE_PROJECT_NAME ——
+# 少一個會跟 INSTANCE 走鐘的變數。
+name: hermes-${INSTANCE:-default}
+
+# ---------------------------------------------------------------------------
+# 網路
+# ---------------------------------------------------------------------------
+networks:
+  # 應用層。runtime、controller、camofox、以及短暫的 sandbox 都在這裡。
+  hermes-net:
+    name: hermes-${INSTANCE:-default}-net
+
+  # 控制層。internal: true 代表這個網路上的容器完全沒有對外路由 —— 就算
+  # socket-proxy 被打下來，攻擊者也沒有出口可以把資料送出去。
+  #
+  # 注意：internal 限制的是網路，不是檔案掛載。socket-proxy 依然掛得到
+  # /var/run/docker.sock，那是 bind mount，不受這個設定影響。
+  docker-control-net:
+    name: hermes-${INSTANCE:-default}-control
+    internal: true
+
+# ---------------------------------------------------------------------------
+# 卷
+# ---------------------------------------------------------------------------
+volumes:
+  # runtime 自身的狀態：SQLite、sessions、memory、config.yaml、.env。
+  # 這個卷必須可寫 —— hermes 沒有它就跑不起來。
+  hermes-data:
+    name: hermes-${INSTANCE:-default}-data
+
+  # 線上技能目錄。內容是一堆 symlink，每個指向版本庫裡的某個版本。
+  # controller rw、runtime ro，而且兩邊掛在相同的絕對路徑。
+  hermes-skills:
+    name: hermes-${INSTANCE:-default}-skills
+
+  # 技能版本庫。每個技能保留最近 KEEP_VERSIONS 個完整版本供回滾。
+  #
+  # 為什麼是獨立的卷而不是 skills 卷底下的子目錄：上游的技能掃描器用
+  # os.walk(followlinks=True) 走 /opt/data/skills 整棵樹，只排除固定的
+  # .git / .archive / node_modules 等名稱。版本庫如果落在那棵樹裡面，
+  # agent 會同時看到同一個技能的五個歷史世代。
+  hermes-versions:
+    name: hermes-${INSTANCE:-default}-versions
+
+  # controller 的任務資料庫。
+  hermes-state:
+    name: hermes-${INSTANCE:-default}-state
+
+# ---------------------------------------------------------------------------
+# 服務
+# ---------------------------------------------------------------------------
+services:
+
+  # =========================================================================
+  # hermes-runtime —— 正式環境的 agent（Dashboard + gateway）
+  # =========================================================================
+  hermes-runtime:
+    build:
+      context: ./runtime
+      args:
+        HERMES_VERSION: ${HERMES_VERSION:-v2026.7.20}
+    image: hermes-runtime:${INSTANCE:-default}
+    container_name: hermes-${INSTANCE:-default}-runtime
+    restart: unless-stopped
+
+    # 上游的 ENTRYPOINT 是 ["/init", "/opt/hermes/docker/main-wrapper.sh"]，
+    # 這裡只給 CMD。/init 是 s6-overlay 的 PID 1，換掉它 cont-init.d 全部不跑。
+    #
+    # Dashboard 不需要另外開一個容器 —— HERMES_DASHBOARD=1（在 runtime/Dockerfile
+    # 裡設定）會讓上游 s6-rc 的 dashboard 服務在同一個容器內起來。
+    command: ["gateway", "run"]
+
+    networks:
+      - hermes-net
+
+    ports:
+      # Dashboard 要能從遠端連接，所以預設綁 0.0.0.0。
+      # 只想開放本機的話，把 .env 的 DASHBOARD_BIND 改成 127.0.0.1。
+      - "${DASHBOARD_BIND:-0.0.0.0}:${DASHBOARD_PORT:-9119}:9119"
+
+    volumes:
+      # runtime 自身的可寫狀態。
+      - hermes-data:/opt/data
+
+      # 進化出來的技能，唯讀。這是「正式環境穩定」原則的落實：
+      # 會變動的程式碼對 runtime 唯讀，只有 controller 能寫。
+      #
+      # 開機時會看到一行 `[stage2] Warning: chown /opt/data/skills failed`。
+      # 那是預期的 —— 上游的 stage2-hook 想 chown 整棵 skills 樹，撞到這個
+      # 唯讀掛載。上游把 chown 失敗吞掉只印 warning（docker/stage2-hook.sh
+      # 的 chown_hermes_tree），開機流程不受影響。
+      - hermes-skills:/opt/data/skills/evolved:ro
+
+      # 版本庫，唯讀。evolved/ 裡的 symlink 指向這裡，沒掛就全部斷掉。
+      - hermes-versions:/opt/data/skill-versions:ro
+
+      # 讓 runtime 的 terminal 能操作外部掛進來的 /workspace 資料夾。
+      # 搭配 runtime/Dockerfile 的 HERMES_WRITE_SAFE_ROOT=/opt/data:/workspace。
+      - ${WORKSPACE_DIR:-./workspace}:/workspace
+
+      # GCP service account 憑證，唯讀。目錄裡沒放 JSON 的話整段是 no-op ——
+      # vertex_adapter 的 _resolve_credentials_path() 會做 os.path.exists()
+      # 檢查，檔案不在就當作沒設定，退回 ADC 再退回「不啟用 Vertex」。
+      #
+      # 掛的是「目錄」不是「檔案」，這是刻意的：compose 沒有條件式 volume，
+      # 而掛不存在的宿主機檔案時 docker 會建出一個同名目錄 —— 那會讓
+      # os.path.exists() 回 True，然後 from_service_account_file() 炸掉。
+      #
+      # 掛在 /opt/gcp 而不是 /opt/data 底下：/opt/data 是 hermes 使用者的
+      # HOME，在 HERMES_WRITE_SAFE_ROOT 內而且是持久化資料卷，憑證不該進去。
+      - ${GCP_CREDS_DIR:-./secrets}:/opt/gcp:ro
+
+    environment:
+      # 讓容器內寫出來的檔案在宿主機上屬於你。上游的 stage2-hook 會在開機時
+      # 把內建的 hermes 使用者重新映射到這組 UID/GID。
+      HERMES_UID: ${HERMES_UID:-10000}
+      HERMES_GID: ${HERMES_GID:-10000}
+
+      # Dashboard 的 basic auth。上游 2026 年 6 月的強化之後，只要綁定位址
+      # 不是 loopback，dashboard 就強制要求一個 auth provider，否則 fail
+      # closed（所有路由都擋掉）。
+      #
+      # `:?` 語法讓「忘記設密碼」在 `docker compose up` 當下就明確失敗，
+      # 而不是等到連不上 dashboard 才去翻 log。
+      HERMES_DASHBOARD_BASIC_AUTH_USERNAME: ${HERMES_DASHBOARD_BASIC_AUTH_USERNAME:-admin}
+      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: ${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD:?必須設定 —— dashboard 綁在 0.0.0.0 上，沒有 auth provider 會 fail closed。請在 .env 裡設一個強密碼。}
+
+      # 推論後端。外接的地端 vLLM 走這裡；模型與 base_url 實際上
+      # 由 /opt/data/config.yaml 決定，見 README 與 examples/config.vllm.yaml。
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+
+      # Vertex AI（GCP）。憑證是上面那個 /opt/gcp 掛載裡的 service account
+      # JSON —— Vertex 用它換短效 OAuth2 token，沒有靜態金鑰可設。
+      #
+      # 永遠設著是安全的：檔案不存在時 adapter 直接跳過（見上面的掛載註解）。
+      # 上游還認得 GOOGLE_APPLICATION_CREDENTIALS，兩者同義且
+      # VERTEX_CREDENTIALS_PATH 優先；這裡刻意只設一個，避免兩邊指到不同檔案
+      # 時要去猜哪個生效。
+      VERTEX_CREDENTIALS_PATH: /opt/gcp/${VERTEX_SA_FILE:-gcp-sa.json}
+
+      # 空字串等同於「沒設」（adapter 會 .strip() 後判斷），此時以
+      # config.yaml 的 vertex: 區塊為準。
+      VERTEX_PROJECT_ID: ${VERTEX_PROJECT_ID:-}
+      VERTEX_REGION: ${VERTEX_REGION:-}
+
+      # controller 的位址，讓 agent 自己有辦法送出進化任務。
+      HERMES_CONTROLLER_URL: http://hermes-controller:9200
+
+    extra_hosts:
+      # 讓跑在宿主機上的 vLLM（例如 http://host.docker.internal:8000/v1）連得到。
+      # Docker Desktop 本來就有這個名稱，Linux 上需要這行才會有。
+      - "host.docker.internal:host-gateway"
+
+    # 進化任務可能吃掉不少記憶體，但 runtime 本身不該被沙箱拖垮。
+    stop_grace_period: 30s
+
+  # =========================================================================
+  # hermes-controller —— 進化生命週期管理
+  # =========================================================================
+  hermes-controller:
+    build:
+      context: ./controller
+      args:
+        HERMES_UID: ${HERMES_UID:-10000}
+        HERMES_GID: ${HERMES_GID:-10000}
+    image: hermes-controller:${INSTANCE:-default}
+    container_name: hermes-${INSTANCE:-default}-controller
+    restart: unless-stopped
+
+    # 唯一同時連上兩個網路的服務。它是應用層與 Docker 控制層之間的橋 ——
+    # runtime 永遠碰不到 socket-proxy。
+    networks:
+      - hermes-net
+      - docker-control-net
+
+    # 刻意不發佈任何埠。這個 API 沒有身分驗證，網路拓撲就是它的邊界。
+    # 要從宿主機除錯的話用 `docker compose exec hermes-controller curl ...`。
+
+    depends_on:
+      docker-socket-proxy:
+        condition: service_started
+
+    volumes:
+      # 兩個技能卷。路徑必須與 runtime 容器內的完全一致 —— evolved/ 裡的
+      # symlink 是相對路徑，兩邊的相對關係要對得上。
+      - hermes-skills:/opt/data/skills/evolved
+      - hermes-versions:/opt/data/skill-versions
+
+      # 任務資料庫。
+      - hermes-state:/state
+
+      # 掃描政策。唯讀掛進來，改規則不用重建映像 —— 但也代表 controller
+      # 自己改不了自己的安全政策。
+      - ./controller/policy.yaml:/opt/controller/policy.yaml:ro
+
+    # 刻意「沒有」掛載 /var/run/docker.sock。controller 對 Docker 的所有存取
+    # 都必須經過 socket-proxy 的白名單。config.py 會在啟動時拒絕任何非
+    # tcp:// 的 DOCKER_HOST。
+    #
+    # 也刻意「沒有」掛載 GCP 憑證（runtime 的 /opt/gcp）。controller 不做推論，
+    # 而它動態建立的 sandbox 跑的是還沒通過審查的進化產物 —— 憑證離那條路徑
+    # 愈遠愈好。
+
+    environment:
+      INSTANCE: ${INSTANCE:-default}
+
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      DOCKER_API_TIMEOUT: ${DOCKER_API_TIMEOUT:-60}
+
+      # sandbox 映像與網路。網路名稱直接寫死交給 Docker —— controller 絕不
+      # 呼叫 /networks（socket-proxy 的 NETWORKS=0，會回 403）。
+      SANDBOX_IMAGE: hermes-sandbox:${INSTANCE:-default}
+      SANDBOX_NETWORK: hermes-${INSTANCE:-default}-net
+      SANDBOX_TIMEOUT_SEC: ${SANDBOX_TIMEOUT_SEC:-900}
+      SANDBOX_MEMORY_MB: ${SANDBOX_MEMORY_MB:-2048}
+      SANDBOX_CPUS: ${SANDBOX_CPUS:-2.0}
+      SANDBOX_PIDS_LIMIT: ${SANDBOX_PIDS_LIMIT:-512}
+      MAX_CONCURRENT_TASKS: ${MAX_CONCURRENT_TASKS:-2}
+
+      LIVE_SKILLS_DIR: /opt/data/skills/evolved
+      SKILL_VERSIONS_DIR: /opt/data/skill-versions
+      STATE_DIR: /state
+      KEEP_VERSIONS: ${KEEP_VERSIONS:-5}
+
+      SCANNER_POLICY_FILE: /opt/controller/policy.yaml
+      SCANNER_ENFORCE: ${SCANNER_ENFORCE:-1}
+
+      REAPER_INTERVAL_SEC: ${REAPER_INTERVAL_SEC:-120}
+
+      # 必須與 runtime 的 hermes 使用者一致，否則 runtime 讀不到晉升出來的技能。
+      HERMES_UID: ${HERMES_UID:-10000}
+      HERMES_GID: ${HERMES_GID:-10000}
+
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+    stop_grace_period: 30s
+
+  # =========================================================================
+  # docker-socket-proxy —— 最小特權的 Docker API 閘道
+  # =========================================================================
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:v0.4.2
+    container_name: hermes-${INSTANCE:-default}-socket-proxy
+    restart: unless-stopped
+
+    # 只在 internal 網路上。宿主機與外部都連不到它 —— 唯一的客戶端是
+    # controller。
+    networks:
+      - docker-control-net
+
+    volumes:
+      # 唯讀掛載 socket。這擋不了寫入類 API（Docker 的 socket 沒有讀寫分離，
+      # :ro 只是防止有人改掉 socket 檔本身），真正的過濾在下面的白名單。
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    environment:
+      # --- 放行（controller 建立與管理沙箱所需的最小集合）------------------
+      CONTAINERS: 1    # create / inspect / logs / wait / archive / remove
+      IMAGES: 1        # 檢查 sandbox 映像是否存在
+      INFO: 1          # /info、/version（docker SDK 協商 API 版本要用）
+      POST: 1          # 沒有這個就全部是唯讀操作，連容器都建不了
+      ALLOW_START: 1
+      ALLOW_STOP: 1
+      EXEC: 1          # 保留給互動式除錯
+
+      # --- 拒絕（Swarm、Network、Secret API 一律不開）----------------------
+      SWARM: 0
+      NETWORKS: 0
+      SECRETS: 0
+      CONFIGS: 0
+      NODES: 0
+      SERVICES: 0
+      TASKS: 0
+      PLUGINS: 0
+      SYSTEM: 0
+      DISTRIBUTION: 0
+      SESSION: 0
+      AUTH: 0
+      BUILD: 0
+      COMMIT: 0
+      VOLUMES: 0
+      ALLOW_RESTARTS: 0
+
+    # ⚠️ 誠實揭露：這不是完整的授權邊界。
+    # 一旦放行 CONTAINERS + POST，取得 controller 執行權的攻擊者就能建立
+    # privileged 容器或掛載宿主機路徑，藉此逃逸。它確實擋掉了 Swarm /
+    # Secrets / Networks / Configs（白名單之外一律拒絕），但不該被當成
+    # 「即使 controller 被攻陷也安全」的保證。
+
+  # =========================================================================
+  # camofox —— 反偵測瀏覽器 sidecar
+  # =========================================================================
+  #
+  # 放在 browser profile 底下，預設的 `docker compose up` 不會拉這個映像
+  # （解壓後約 3.5GB，裡面有一整套 Camoufox/Firefox）。要啟用：
+  #     docker compose --profile browser up -d
+  camofox:
+    profiles: ["browser"]
+    # 上游有發佈多架構映像（amd64 + arm64），不需要自建。版本釘住，理由與
+    # HERMES_VERSION 相同。
+    #
+    # 要改用原始碼建置的話（例如要打 patch），把 image 換成：
+    #     build:
+    #       context: https://github.com/jo-inc/camofox-browser.git#master
+    #       dockerfile: Dockerfile.ci
+    # default branch 是 master 不是 main，而且建置時會下載數百 MB 的 binary。
+    image: ghcr.io/jo-inc/camofox-browser:${CAMOFOX_VERSION:-1.13.0}
+    container_name: hermes-${INSTANCE:-default}-camofox
+    restart: unless-stopped
+
+    networks:
+      - hermes-net
+
+    ports:
+      # 預設只綁 loopback —— 這是個能任意連外的瀏覽器，不該直接曝在 LAN 上。
+      - "${CAMOFOX_BIND:-127.0.0.1}:${CAMOFOX_PORT:-9377}:9377"
+
+    environment:
+      CAMOFOX_PORT: 9377
+      MAX_OLD_SPACE_SIZE: ${CAMOFOX_HEAP_MB:-512}
+
+    # Firefox 需要比 Docker 預設的 64MB 更大的 /dev/shm，否則分頁會隨機崩潰。
+    shm_size: ${CAMOFOX_SHM_SIZE:-1gb}
+
+# ---------------------------------------------------------------------------
+# hermes-sandbox 為什麼不在這裡
+# ---------------------------------------------------------------------------
+# 沙箱是短暫容器，由 controller 針對每一個進化任務動態建立、任務結束後強制
+# 移除（「沙箱隔離」原則）。它不是常駐服務，所以不是 compose 服務。
+#
+# 但它的映像還是要先建好。Makefile 的 `build` 目標會一併處理；手動建置：
+#     docker build -t hermes-sandbox:${INSTANCE:-default} ./sandbox

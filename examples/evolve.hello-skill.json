@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "進化任務的請求範例。提交：",
+    "    make evolve REQ=examples/evolve.hello-skill.json",
+    "",
+    "流程：controller 起一個沙箱容器跑下面的 steps，把 /work/out/ 底下的檔案",
+    "收回來，做 AST 靜態安全掃描，通過才原子性晉升到 /opt/data/skills/evolved/。",
+    "",
+    "沙箱是這整套架構裡唯一可以自由 pip install 的地方 —— 絕不在 Runtime",
+    "容器內執行 pip install。容器在任務結束後強制移除。",
+    "",
+    "產物必須包含 SKILL.md，否則晉升階段會拒絕 —— 那是 hermes 技能格式的規定。",
+    "JSON 沒有註解語法，所以借用這個被忽略的欄位。"
+  ],
+
+  "skill": "hello-skill",
+  "timeout_sec": 300,
+
+  "env": {
+    "GREETING": "hello from the sandbox"
+  },
+
+  "steps": [
+    {
+      "name": "write-skill-md",
+      "timeout_sec": 60,
+      "run": "mkdir -p /work/out && cat > /work/out/SKILL.md <<'EOF'\n---\nname: hello-skill\ndescription: A minimal skill produced by the evolution pipeline, used to verify the sandbox → scan → promote path end to end.\n---\n\n# Hello Skill\n\nThis skill exists to prove the evolution pipeline works. When asked to\ndemonstrate the pipeline, run `scripts/greet.py` and report its output.\n\n## Usage\n\n```bash\npython scripts/greet.py\n```\nEOF"
+    },
+    {
+      "name": "write-script",
+      "timeout_sec": 60,
+      "run": "mkdir -p /work/out/scripts && cat > /work/out/scripts/greet.py <<'EOF'\n\"\"\"Minimal script for hello-skill.\n\nDeliberately boring: no subprocess, no sockets, no dynamic exec. The\npromotion scanner rejects all of those, so this doubles as a check that a\nwell-behaved skill passes cleanly.\n\"\"\"\nimport os\n\n\ndef greet() -> str:\n    return os.environ.get(\"GREETING\", \"hello\")\n\n\nif __name__ == \"__main__\":\n    print(greet())\nEOF"
+    },
+    {
+      "name": "self-test",
+      "timeout_sec": 120,
+      "run": ["python", "/work/out/scripts/greet.py"]
+    }
+  ]
+}

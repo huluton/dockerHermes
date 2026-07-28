@@ -1,0 +1,87 @@
+# Hermes 設定範本 —— Vertex AI（Google Cloud）
+#
+# 這個檔案要放到 runtime 資料卷裡的 /opt/data/config.yaml。
+#
+#     make seed-config TEMPLATE=config.vertex.yaml           # 已存在則不覆蓋
+#     make seed-config TEMPLATE=config.vertex.yaml FORCE=1   # 備份舊的再覆蓋
+#
+# 憑證「不」寫在這裡。Vertex 走 OAuth2，不是靜態 API key —— 你放的是一份
+# service account JSON，路徑由 .env 的 GCP_CREDS_DIR / VERTEX_SA_FILE 決定，
+# 掛進容器的 /opt/gcp/。完整步驟見 README 的「用 Vertex AI（GCP）當推論後端」。
+#
+# 改完之後要重啟才會生效：
+#     docker compose restart hermes-runtime
+
+model:
+  # "vertex" 的別名還有 "google-vertex"、"vertex-ai"、"gcp-vertex"，效果相同。
+  #
+  # 注意這跟 "gemini" 是兩個不同的 provider：gemini 走 Google AI Studio 的
+  # API key，vertex 走 GCP 專案 + IAM。要企業級配額、要走自己的 GCP 帳單，
+  # 用 vertex。
+  provider: "vertex"
+
+  # 可選的模型（上游精選清單）：
+  #
+  #   google/gemini-3.1-pro-preview          最強，最貴
+  #   google/gemini-3-pro-preview
+  #   google/gemini-3-flash-preview          速度與成本的平衡點，預設
+  #   google/gemini-3.1-flash-lite-preview   最便宜
+  #   google/gemini-2.5-pro                  已 GA，不是 preview
+  #   google/gemini-2.5-flash                已 GA，不是 preview
+  #
+  # 名稱前面的 "google/" 是必要的，不能省。
+  default: "google/gemini-3-flash-preview"
+
+  # --- 這裡「不要」設 base_url ---------------------------------------------
+  #
+  # Vertex 的端點位址是執行期依 project_id + region 算出來的：
+  #
+  #     https://{host}/v1beta1/projects/{project}/locations/{region}/endpoints/openapi
+  #
+  # 手動填一個上去只會蓋掉正確的值，然後拿到 404。把它留空、或整行刪掉。
+
+  # --- 這裡也「不要」設 api_key --------------------------------------------
+  #
+  # Vertex 用 service account 換短效的 OAuth2 bearer token，每次快到期就自動
+  # 換新。沒有「一組固定金鑰」這種東西。
+
+  # --- token 上限 -----------------------------------------------------------
+  #
+  # Gemini 3.x 的上下文視窗是 1M token。設這麼大不代表每次都會用滿 ——
+  # 這只是「允許到多大」的上限，實際計費看實際送出去多少。
+  context_length: 1000000
+
+  # 單次回應的輸出上限。
+  max_tokens: 8192
+
+  temperature: 0.7
+
+# ---------------------------------------------------------------------------
+# Vertex 的路由設定
+# ---------------------------------------------------------------------------
+# 這兩項是「非機密」的，所以放 config.yaml 而不是 .env。
+#
+# 環境變數優先：.env 裡設了 VERTEX_PROJECT_ID / VERTEX_REGION 的話，會蓋掉
+# 這裡的值。兩邊都不設就用下面的預設。
+vertex:
+  # GCP 專案 ID。留空的話，用 service account JSON 裡內嵌的那個 project ——
+  # 大多數情況留空就對了，除非你的 SA 屬於 A 專案但要對 B 專案計費。
+  project_id: ""
+
+  # ⚠️ Gemini 3.x 的 preview 模型「只」在 global endpoint 上。改成區域值
+  #    （us-central1 之類）不會報錯，而是靜默 404 —— 症狀是模型「不存在」。
+  #
+  #    只有在你用的是 GA 模型（gemini-2.5-*）而且有資料落地需求時，才改成
+  #    區域值。
+  region: "global"
+
+# ---------------------------------------------------------------------------
+# 進化出來的技能
+# ---------------------------------------------------------------------------
+# controller 晉升的技能會出現在 /opt/data/skills/evolved/ 底下（唯讀掛載），
+# 上游的技能掃描器會自動撿到，不需要在這裡列出來。
+#
+# 要停用某個技能：
+# skills:
+#   disabled:
+#     - some-skill-name

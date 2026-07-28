@@ -1,0 +1,150 @@
+# 技能晉升前的靜態安全掃描政策。
+#
+# 這份檔案在 controller 啟動時載入。調整規則只需要重啟 controller，不必重建
+# 映像（compose 有把它以唯讀方式掛進去）。
+#
+# 這裡沒有列到的鍵，會沿用 scanner.py 內建的嚴格後備值 —— 這個方向是刻意的：
+# 政策檔漏寫某一項時，補上的應該是「比較嚴」而不是「沒有規則」。
+#
+# --- 這一層真正在防什麼 ---------------------------------------------------
+# 防的是「被誤導的 agent 產出意外危險的程式碼」。這是自我進化系統裡最常見的
+# 失效模式：LLM 為了清暫存檔寫出 shutil.rmtree、為了偵錯留下反向 shell。
+#
+# 防不了的是「有決心的對手」。任何以黑名單為基礎的 Python 原始碼分析都能被
+# 繞過。真正的隔離邊界是沙箱容器，不是這份 YAML。
+
+# 完全禁止在技能程式碼中匯入的模組。
+#
+# 判斷標準：技能是資料處理與 API 呼叫的邏輯。需要開 socket、fork 行程、
+# 或反序列化任意物件的技能，要嘛設計錯了，要嘛是我們不想要的東西。
+denied_imports:
+  # 執行外部程式。技能要跑指令的話，應該走 hermes 自己的 terminal 工具，
+  # 那條路徑有既有的核准與稽核機制。
+  - subprocess
+  - pty
+  - ptyprocess
+
+  # 原生程式碼介面 —— 直接繞過所有 Python 層級的防護。
+  - ctypes
+  - cffi
+
+  # 原始網路存取。技能該用 httpx / requests，那是有明確語意的高層介面。
+  - socket
+  - socketserver
+  - telnetlib
+  - ftplib
+  - smtplib
+
+  # 反序列化任意物件 = 任意程式碼執行。
+  - pickle
+  - cPickle
+  - dill
+  - marshal
+  - shelve
+
+  # 行程與直譯器層級的操作。
+  - multiprocessing
+  - resource
+  - gc
+
+# 完全禁止的呼叫。支援點分名稱（os.system）與裸名稱（eval）。
+#
+# 掃描器也會抓 `from os import system` 之後直接呼叫 `system(...)` 的迂迴寫法。
+denied_calls:
+  # 動態執行程式碼。
+  - eval
+  - exec
+  - compile
+  - __import__
+  - breakpoint
+  - importlib.import_module
+  - importlib.__import__
+
+  # 透過 os 模組執行外部程式。
+  - os.system
+  - os.popen
+  - os.execl
+  - os.execle
+  - os.execlp
+  - os.execv
+  - os.execve
+  - os.execvp
+  - os.execvpe
+  - os.spawnl
+  - os.spawnv
+  - os.spawnve
+  - os.fork
+  - os.forkpty
+  - os.posix_spawn
+
+  # 破壞性的檔案系統操作。技能可以寫自己的檔案，但不該做遞迴刪除 ——
+  # 一個算錯路徑的 rmtree 可以把整個資料卷清空。
+  - shutil.rmtree
+  - os.removedirs
+  - os.truncate
+
+  # 權限提升。
+  - os.setuid
+  - os.setgid
+  - os.seteuid
+  - os.setegid
+  - os.chown
+  - os.chmod
+
+# 被禁止存取的屬性。這些全部是「沙箱逃逸」的經典元件 —— 從一個無害的物件
+# 一路爬到 __builtins__，就能取回被拿走的所有能力。
+denied_attributes:
+  # 爬鏈的起點。`self.__class__.__name__` 這種無害的寫法也會被擋 ——
+  # 這是刻意的取捨：技能程式碼幾乎不需要它，而它是逃逸鏈的第一環。
+  - __class__
+  - __globals__
+  - __subclasses__
+  - __builtins__
+  - __code__
+  - __bases__
+  - __mro__
+  - __reduce__
+  - __reduce_ex__
+  - __getattribute__
+  - __dict__
+  - func_globals
+
+# AST 之外的樣式比對。抓的是 AST 看不見的東西 —— 字串內容、註解、
+# 以及節點層級表達不出來的結構特徵。
+denied_patterns:
+  - name: reverse-shell
+    regex: '(?i)(?:/dev/tcp/|/dev/udp/|nc\s+-e\b|bash\s+-i\s*>&|sh\s+-i\s*>&)'
+    hint: 反向 shell 的典型特徵
+
+  - name: docker-socket
+    regex: '(?:/var/run/docker\.sock|DOCKER_HOST|docker-socket-proxy)'
+    hint: 技能程式碼絕對不該碰 Docker 控制層 —— 那是 controller 的職責
+
+  - name: credential-path
+    regex: '(?:\.ssh/id_[a-z]+|\.aws/credentials|\.docker/config\.json|/opt/data/\.env|authorized_keys)'
+    hint: 疑似存取憑證檔案
+
+  - name: encoded-payload
+    regex: '(?i)(?:base64|b64|codecs)\.(?:b64)?decode\s*\('
+    hint: 編碼過的 payload 常被用來夾帶掃描器看不到的程式碼
+
+  - name: hermes-internals
+    regex: '(?:/opt/hermes/|\.venv/bin/|site-packages/)'
+    hint: 技能不該碰 runtime 自己的安裝樹（那是封存唯讀的）
+
+  - name: skills-self-write
+    regex: '(?:/opt/data/skills|/skills/\.versions|/skills/evolved)'
+    hint: 技能不能自己改寫技能目錄 —— 晉升只能經由 controller
+
+  - name: crontab-persistence
+    regex: '(?i)(?:crontab\s+-|/etc/cron|systemctl\s+enable|\.bashrc|\.profile)'
+    hint: 疑似在建立持久化機制
+
+# 單一原始檔的大小上限。超大的 .py 檔通常是塞了資料（或是編碼過的 blob），
+# 而不是真的程式碼。
+max_file_bytes: 524288
+
+# 只有這些副檔名會走 AST 掃描。其他檔案（SKILL.md、JSON、測試資料）仍然會
+# 經過晉升階段的路徑驗證，所以逃不出技能目錄。
+scanned_suffixes:
+  - .py

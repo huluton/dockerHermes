@@ -1,0 +1,65 @@
+# Hermes 設定範本 —— 接地端 vLLM
+#
+# 這個檔案要放到 runtime 資料卷裡的 /opt/data/config.yaml。
+#
+#     make seed-config              # 已存在則不覆蓋
+#
+# 為什麼不能只用環境變數：hermes 的模型 / provider / base_url 是讀 config.yaml
+# 的，沒有對應的環境變數。上游的 stage2-hook 會在資料卷是空的時候，從
+# cli-config.yaml.example 種一份預設進去 —— 那份預設指向 OpenRouter，
+# 不是你的本地 vLLM。
+#
+# 改完之後要重啟才會生效：
+#     docker compose restart hermes-runtime
+
+model:
+  # "vllm" 是 "custom" 的別名（"ollama"、"llamacpp" 也是）。
+  # 意思就是「任何 OpenAI 相容端點，base_url 我自己給」。
+  provider: "vllm"
+
+  # 你的 vLLM `--served-model-name`（沒指定的話就是 --model 的值）。
+  # 用 `curl http://<host>:8000/v1/models` 確認實際名稱。
+  default: "Qwen/Qwen3-32B"
+
+  # --- base_url 三種情況 -------------------------------------------------
+  #
+  # 1) vLLM 跑在「宿主機」上（最常見）
+  #    docker-compose.yml 已經幫 runtime 與 sandbox 加了
+  #    extra_hosts: host.docker.internal:host-gateway，Linux 上也能用。
+  base_url: "http://host.docker.internal:8000/v1"
+  #
+  # 2) vLLM 是「同一個 compose stack 裡的另一個服務」
+  #    加一個服務接到 hermes-net 上，然後用服務名稱：
+  #    base_url: "http://vllm:8000/v1"
+  #
+  # 3) vLLM 在「區域網路的另一台機器」上
+  #    base_url: "http://192.168.1.50:8000/v1"
+
+  # 沒有開 --api-key 的 vLLM 不驗證金鑰，但 OpenAI 客戶端一定會送一個
+  # Authorization header，所以這裡必須有值。任意字串都可以。
+  #
+  # vLLM 有開 --api-key 的話，改填真正的金鑰。
+  api_key: "none"
+
+  # --- token 上限：兩個容易搞混的設定 -------------------------------------
+  #
+  # context_length 是「總」上下文視窗（輸入 + 輸出）。
+  # 設得比 vLLM 的 --max-model-len 大，長對話會在推論端被拒。
+  # 兩邊對齊，或這邊設得保守一點。
+  context_length: 32768
+
+  # 單次回應的輸出上限。
+  max_tokens: 4096
+
+  temperature: 0.7
+
+# ---------------------------------------------------------------------------
+# 進化出來的技能
+# ---------------------------------------------------------------------------
+# controller 晉升的技能會出現在 /opt/data/skills/evolved/ 底下（唯讀掛載），
+# 上游的技能掃描器會自動撿到，不需要在這裡列出來。
+#
+# 要停用某個技能：
+# skills:
+#   disabled:
+#     - some-skill-name
