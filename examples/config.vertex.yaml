@@ -82,9 +82,7 @@ vertex:
 # 完整說明看那份範本，這裡只留最小設定。
 mcp_servers:
   workspace-fs:
-    command: "/opt/mcp/node_modules/.bin/mcp-server-filesystem"
-    args:
-      - "/workspace"
+    url: "http://hermes-mcp-fs:9300/mcp"
     connect_timeout: 60
     timeout: 120
     tools:

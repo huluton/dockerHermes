@@ -41,15 +41,19 @@ DASH_PORT="$(envget DASHBOARD_PORT)"; DASH_PORT="${DASH_PORT:-9119}"
 DASH_USER="$(envget HERMES_DASHBOARD_BASIC_AUTH_USERNAME)"; DASH_USER="${DASH_USER:-admin}"
 DASH_PASS="$(envget HERMES_DASHBOARD_BASIC_AUTH_PASSWORD)"
 WORKSPACE="$(envget WORKSPACE_DIR)"; WORKSPACE="${WORKSPACE:-./workspace}"
+MCP_PORT="$(envget MCP_FS_PORT)"; MCP_PORT="${MCP_PORT:-9300}"
+MCP_PATH="$(envget MCP_FS_PATH)"; MCP_PATH="${MCP_PATH:-/mcp}"
 FULL="${FULL:-0}"
 
 COMPOSE="docker compose"
 RUNTIME="hermes-runtime"
 CONTROLLER="hermes-controller"
+MCPFS="hermes-mcp-fs"
 
-# 在 runtime / controller 容器裡執行一段 shell。
+# 在 runtime / controller / mcp-fs 容器裡執行一段 shell。
 in_runtime()    { $COMPOSE exec -T "$RUNTIME" sh -c "$1" 2>&1; }
 in_controller() { $COMPOSE exec -T "$CONTROLLER" sh -c "$1" 2>&1; }
+in_mcpfs()      { $COMPOSE exec -T "$MCPFS" sh -c "$1" 2>&1; }
 
 # 從 controller 打 socket-proxy，回傳 HTTP 狀態碼。
 proxy_code() {
@@ -68,7 +72,7 @@ else
     bad "docker compose config 解析失敗" "$($COMPOSE config -q 2>&1 | head -3)"
 fi
 
-for svc in "$RUNTIME" "$CONTROLLER" docker-socket-proxy; do
+for svc in "$RUNTIME" "$MCPFS" "$CONTROLLER" docker-socket-proxy; do
     state="$($COMPOSE ps --format '{{.State}}' "$svc" 2>/dev/null | head -1)"
     case "$state" in
         running) ok "$svc 執行中" ;;
@@ -77,14 +81,16 @@ for svc in "$RUNTIME" "$CONTROLLER" docker-socket-proxy; do
     esac
 done
 
-health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
-    "hermes-${INSTANCE}-runtime" 2>/dev/null)"
-case "$health" in
-    healthy)  ok "runtime healthcheck 通過" ;;
-    starting) soft "runtime 還在 starting" "剛啟動的話等 30 秒再跑一次" ;;
-    none)     soft "runtime 沒有 healthcheck" ;;
-    *)        bad "runtime healthcheck 是 $health" ;;
-esac
+for c in runtime mcp-fs; do
+    health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+        "hermes-${INSTANCE}-${c}" 2>/dev/null)"
+    case "$health" in
+        healthy)  ok "$c healthcheck 通過" ;;
+        starting) soft "$c 還在 starting" "剛啟動的話等 30 秒再跑一次" ;;
+        none)     soft "$c 沒有 healthcheck" ;;
+        *)        bad "$c healthcheck 是 ${health:-（查不到容器）}" ;;
+    esac
+done
 
 # 沒有 runtime 就沒必要往下跑了。
 if [ "$($COMPOSE ps --format '{{.State}}' "$RUNTIME" 2>/dev/null | head -1)" != "running" ]; then
@@ -292,87 +298,130 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-head_ "7. 透過 MCP 操作外部資料夾"
+head_ "7. 透過 MCP 操作外部資料夾（獨立容器）"
 # ---------------------------------------------------------------------------
-# 先確認 bind mount 真的通到宿主機。這一段用容器內的 shell 直接寫，驗的是
-# 掛載本身 —— agent 走的那條路（MCP）在下面單獨驗。
+# 這一節要證明的是「容器邊界」，不只是「工具設定」：外部資料夾只存在於
+# hermes-mcp-fs 裡，runtime 唯一的路徑是 mcp-net 上的 MCP over HTTP。
+
+# 邊界本身。runtime 裡不該有這個掛載點 —— 沒有掛載點，terminal 也拿不到檔案。
+out="$(in_runtime 'test -e /workspace && echo PRESENT || echo ABSENT')"
+if printf '%s' "$out" | grep -q ABSENT; then
+    ok "runtime 容器內沒有 /workspace（外部資料夾不在這個容器裡）"
+else
+    bad "runtime 容器內看得到 /workspace" \
+        "compose 把外部資料夾掛回 runtime 了 —— 那樣 terminal 工具就繞得過 MCP"
+fi
+
+# mcp-fs 這一側：bind mount 真的通到宿主機。
 token="verify-$$-$(date -u +%s)"
-in_runtime "printf '%s' '$token' > /workspace/.verify-probe" >/dev/null
+in_mcpfs "printf '%s' '$token' > /workspace/.verify-probe" >/dev/null
 if [ -f "${WORKSPACE}/.verify-probe" ] && [ "$(cat "${WORKSPACE}/.verify-probe")" = "$token" ]; then
-    ok "/workspace 通到宿主機的 ${WORKSPACE}"
+    ok "mcp-fs 的 /workspace 通到宿主機的 ${WORKSPACE}"
 else
-    bad "workspace 沒有寫穿到宿主機" "檢查 .env 的 WORKSPACE_DIR 與 compose 的 bind mount"
+    bad "workspace 沒有寫穿到宿主機" "檢查 .env 的 WORKSPACE_DIR 與 mcp-fs 的 bind mount"
 fi
 
-# MCP filesystem server 必須在映像裡（建置階段裝的），而且是 root 所有 ——
-# agent 不該改得動自己要呼叫的 server。
-MCP_BIN=/opt/mcp/node_modules/.bin/mcp-server-filesystem
-out="$(in_runtime "test -x $MCP_BIN && stat -c %u /opt/mcp")"
-case "$(printf '%s' "$out" | tr -d '\r\n ')" in
-    0)  ok "MCP filesystem server 在映像裡且為 root 所有（$MCP_BIN）" ;;
-    "") bad "找不到 MCP filesystem server" "runtime 映像是舊的？執行 make build" ;;
-    *)  bad "/opt/mcp 的擁有者 uid=$out（預期 0）" "agent 不該改得動自己要呼叫的 server" ;;
-esac
-
-out="$(in_runtime 'command -v node >/dev/null && echo HAVE_NODE')"
-if printf '%s' "$out" | grep -q HAVE_NODE; then
-    ok "runtime 有 node（stdio MCP server 要用）"
+# 網路拓撲：runtime 到得了，sandbox（與 controller 同在 hermes-net）到不了。
+out="$(in_runtime 'getent hosts hermes-mcp-fs >/dev/null 2>&1 && echo RESOLVED || echo NXDOMAIN')"
+if printf '%s' "$out" | grep -q RESOLVED; then
+    ok "runtime 解析得到 hermes-mcp-fs（兩邊都在 mcp-net 上）"
 else
-    bad "runtime 沒有 node" "上游映像本來內建 Node 22 —— 換版之後不見了？"
+    bad "runtime 解析不到 hermes-mcp-fs" "runtime 沒有加進 mcp-net —— MCP 工具會整組消失"
 fi
 
-# 真的講一次 MCP handshake。啟動 server、送 initialize、看它回不回 serverInfo。
-# 這證明的是「agent 呼叫得動這條路徑」，不只是檔案存在。
-init_req='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"hermes-verify","version":"1"}}}'
-inited='{"jsonrpc":"2.0","method":"notifications/initialized"}'
-out="$(in_runtime "printf '%s\n' '$init_req' | timeout 30 $MCP_BIN /workspace 2>&1 | head -5")"
-if printf '%s' "$out" | grep -q '"serverInfo"'; then
-    ok "MCP handshake 成功（server 回了 serverInfo）"
+out="$(in_controller 'getent hosts hermes-mcp-fs >/dev/null 2>&1 && echo RESOLVED || echo NXDOMAIN')"
+if printf '%s' "$out" | grep -q NXDOMAIN; then
+    ok "controller / sandbox 所在的網路解析不到 hermes-mcp-fs"
 else
-    bad "MCP handshake 失敗" "$(printf '%s' "$out" | head -2)"
+    bad "hermes-net 上解析得到 hermes-mcp-fs" \
+        "還沒審查過的進化產物就能直接打 MCP 端點 —— 那個端點沒有身分驗證"
 fi
 
-# 端到端：透過 MCP 讀上面那個寫進外部資料夾的探針檔，內容要對得上。
-probe_req='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_text_file","arguments":{"path":"/workspace/.verify-probe"}}}'
-out="$(in_runtime "printf '%s\n%s\n%s\n' '$init_req' '$inited' '$probe_req' \
-    | timeout 30 $MCP_BIN /workspace 2>&1")"
-if printf '%s' "$out" | grep -q "$token"; then
+net_internal="$(docker network inspect -f '{{.Internal}}' "hermes-${INSTANCE}-mcp" 2>/dev/null)"
+if [ "$net_internal" = "true" ]; then
+    ok "mcp-net 是 internal（掛著使用者資料夾的容器沒有對外路由）"
+else
+    bad "mcp-net 的 Internal=${net_internal:-?}" "預期 true"
+fi
+
+# 端到端：從 runtime 用 HTTP 講一次完整的 MCP —— initialize、讀探針檔、
+# 再要求一個清單外的路徑。這證明的是 agent 真的走得通這條路，而不只是
+# 「容器在跑」。
+#
+# 用 sh -s 餵整段腳本進去，而不是塞成一行 sh -c —— session id 要在多次
+# curl 之間傳遞，那在單行字串裡會變成一團跳脫字元。
+mcp_out="$($COMPOSE exec -T "$RUNTIME" sh -s \
+    "http://hermes-mcp-fs:${MCP_PORT}${MCP_PATH}" <<'MCP_PROBE' 2>&1
+url="$1"
+ct='Content-Type: application/json'
+acc='Accept: application/json, text/event-stream'
+hdr=/tmp/.verify-mcp-hdr
+init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"hermes-verify","version":"1"}}}'
+
+printf 'INIT %s\n' "$(curl -s -m 20 -D "$hdr" -H "$ct" -H "$acc" -d "$init" "$url" | tr -d '\r\n')"
+sid="$(tr -d '\r' < "$hdr" | sed -n 's/^[Mm][Cc][Pp]-[Ss]ession-[Ii][Dd]: *//p' | head -1)"
+rm -f "$hdr"
+[ -n "$sid" ] || { echo 'NOSESSION'; exit 0; }
+
+call() {
+    curl -s -m 20 -H "$ct" -H "$acc" -H "mcp-session-id: $sid" -d "$1" "$url" | tr -d '\r\n'
+}
+call '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null
+printf 'READ %s\n' "$(call '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_text_file","arguments":{"path":"/workspace/.verify-probe"}}}')"
+printf 'DENY %s\n' "$(call '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_text_file","arguments":{"path":"/etc/passwd"}}}')"
+curl -s -m 10 -X DELETE -H "mcp-session-id: $sid" "$url" >/dev/null
+MCP_PROBE
+)"
+
+init_line="$(printf '%s' "$mcp_out" | grep '^INIT ' | head -1)"
+read_line="$(printf '%s' "$mcp_out" | grep '^READ ' | head -1)"
+deny_line="$(printf '%s' "$mcp_out" | grep '^DENY ' | head -1)"
+
+if printf '%s' "$init_line" | grep -q '"serverInfo"'; then
+    ok "從 runtime 打 MCP over HTTP 握手成功（server 回了 serverInfo）"
+elif printf '%s' "$mcp_out" | grep -q NOSESSION; then
+    bad "MCP 握手沒拿到 session id" "$(printf '%s' "$init_line" | head -c 160)"
+else
+    bad "MCP 握手失敗" "$(printf '%s' "$mcp_out" | head -2 | head -c 200)"
+fi
+
+if printf '%s' "$read_line" | grep -q "$token"; then
     ok "MCP 讀得到外部資料夾的內容（read_text_file /workspace/.verify-probe）"
 else
-    bad "MCP 讀不到 /workspace/.verify-probe" "$(printf '%s' "$out" | tail -1 | head -c 160)"
+    bad "MCP 讀不到 /workspace/.verify-probe" "$(printf '%s' "$read_line" | head -c 200)"
 fi
 rm -f "${WORKSPACE}/.verify-probe"
 
-# 授權邊界：server 只接受命令列上列出的根目錄。這裡故意不把 / 列進去，
-# 然後要求它讀 /etc/passwd —— 必須被拒。
-read_req='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_text_file","arguments":{"path":"/etc/passwd"}}}'
-out="$(in_runtime "printf '%s\n%s\n%s\n' '$init_req' '$inited' '$read_req' \
-    | timeout 30 $MCP_BIN /workspace 2>&1")"
-if printf '%s' "$out" | grep -qi 'root:x:0:0'; then
-    bad "MCP server 讀得到 /etc/passwd" "允許根目錄的限制沒有生效"
-elif printf '%s' "$out" | grep -qiE 'outside allowed|not allowed|access denied|"isError":true'; then
+# 授權邊界：server 只接受 MCP_FS_ROOTS 列出的根目錄。/etc/passwd 必須被拒。
+if printf '%s' "$deny_line" | grep -q 'root:x:0:0'; then
+    bad "MCP server 讀得到自己容器裡的 /etc/passwd" "MCP_FS_ROOTS 的限制沒有生效"
+elif printf '%s' "$deny_line" | grep -qiE 'outside allowed|not allowed|access denied|"isError":true'; then
     ok "MCP server 拒絕允許清單外的路徑（/etc/passwd）"
 else
-    soft "分辨不出 MCP server 對 /etc/passwd 的回應" "$(printf '%s' "$out" | tail -1 | head -c 160)"
+    soft "分辨不出 MCP server 對 /etc/passwd 的回應" "$(printf '%s' "$deny_line" | head -c 200)"
 fi
 
 # config.yaml 有沒有真的把 server 接起來。沒接的話 agent 那邊看不到 mcp__ 工具。
-out="$(in_runtime 'grep -A6 "^mcp_servers:" /opt/data/config.yaml 2>/dev/null')"
-if printf '%s' "$out" | grep -q 'mcp-server-filesystem'; then
-    ok "config.yaml 的 mcp_servers 已接上 filesystem server"
+out="$(in_runtime 'grep -A12 "^mcp_servers:" /opt/data/config.yaml 2>/dev/null')"
+if printf '%s' "$out" | grep -qE '^[[:space:]]*url:'; then
+    ok "config.yaml 的 mcp_servers 已指向 remote MCP server"
+elif printf '%s' "$out" | grep -q 'mcp-server-filesystem'; then
+    bad "config.yaml 還在用舊的 stdio 設定（command: .../mcp-server-filesystem）" \
+        "那個 binary 已經不在 runtime 映像裡了。改成 url: http://hermes-mcp-fs:${MCP_PORT}${MCP_PATH}，範本見 examples/config.vllm.yaml"
 else
     bad "config.yaml 裡沒有 mcp_servers 設定" \
         "跑 make seed-config（已有設定檔的話手動補上，範本見 examples/config.vllm.yaml）"
 fi
 
-# 預設 HERMES_WRITE_SAFE_ROOT 只有 /opt/data —— 外部資料夾走 MCP。
-# 有人刻意設回 /opt/data:/workspace 是允許的，所以這裡只提示，不算失敗。
-out="$(in_runtime 'echo $HERMES_WRITE_SAFE_ROOT')"
-if printf '%s' "$out" | grep -q '/workspace'; then
-    soft "HERMES_WRITE_SAFE_ROOT 含 /workspace" \
-        "原生 write_file/patch 也能直接寫外部資料夾（.env 明確設過就是預期行為）"
+# mcp-fs 的根檔案系統唯讀 —— 它唯一該寫的地方是掛進來的資料夾。
+out="$(in_mcpfs 'touch /opt/mcp/.verify-probe 2>&1; echo "rc=$?"')"
+if printf '%s' "$out" | grep -qi 'read-only file system'; then
+    ok "mcp-fs 的根檔案系統唯讀（改不動 server 自己的程式碼）"
+elif printf '%s' "$out" | grep -q 'rc=0'; then
+    bad "mcp-fs 寫得進 /opt/mcp" "compose 的 read_only: true 沒有生效"
+    in_mcpfs 'rm -f /opt/mcp/.verify-probe' >/dev/null
 else
-    ok "HERMES_WRITE_SAFE_ROOT 不含 /workspace（外部資料夾只走 MCP）"
+    soft "/opt/mcp 寫入被擋，但錯誤訊息不是預期的" "$(printf '%s' "$out" | head -1)"
 fi
 
 # ---------------------------------------------------------------------------

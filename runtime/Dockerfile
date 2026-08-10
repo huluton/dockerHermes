@@ -7,10 +7,13 @@
 # 為 root 所有且對 agent 唯讀）、修補過 WAL bug 的 SQLite、Node 22、
 # Playwright chromium，並且已發佈 linux/amd64 與 linux/arm64 兩種架構。
 #
-# 我們在這裡做的只有「設定」，外加一份在建置階段就固定下來的 MCP filesystem
-# server（見下面的 mcp stage）—— 執行期不安裝任何東西，這正是「絕不在
-# Runtime 容器內執行 pip install」這條原則。所有需要安裝依賴的進化工作都發生
-# 在 hermes-sandbox 這個短暫容器裡。
+# 我們在這裡做的只有「設定」—— 執行期不安裝任何東西，這正是「絕不在 Runtime
+# 容器內執行 pip install」這條原則。所有需要安裝依賴的進化工作都發生在
+# hermes-sandbox 這個短暫容器裡。
+#
+# 這個容器裡「沒有」使用者的外部資料夾。存取外部資料夾的唯一路徑是打到
+# hermes-mcp-fs 那個獨立容器的 MCP over HTTP —— 見 mcp-fs/Dockerfile 與
+# README 的「3. 透過 MCP 操作外部資料夾」。
 #
 # 版本預設釘住而非用 :latest：自我進化的 agent 已經有夠多變動來源了，底層
 # runtime 不該是其中之一。要更新到最新版：改 .env 的 HERMES_VERSION（填
@@ -18,67 +21,25 @@
 # 「6. 更新到最新版」。
 ARG HERMES_VERSION=v2026.7.20
 
-# MCP filesystem server 的版本，同樣釘住。查最新版：
-#     npm view @modelcontextprotocol/server-filesystem version
-ARG MCP_FS_VERSION=2026.7.10
-
-# ---------------------------------------------------------------------------
-# mcp stage —— 把 MCP filesystem server 抓下來，之後整包複製進 runtime
-# ---------------------------------------------------------------------------
-# 為什麼不在 runtime 裡直接 `npx -y @modelcontextprotocol/server-filesystem`：
-# npx 會在「agent 第一次呼叫工具」的當下連上 npm registry 下載套件 —— 那是
-# 執行期安裝，離線環境直接失敗，而且每次拉到的內容不保證一樣。改成建置階段
-# 裝好、版本釘死，執行期只是啟動一個本機子行程。
-#
-# 純 JavaScript，沒有原生模組，所以這一層在 amd64 與 arm64 上內容相同 ——
-# 因此固定用 $BUILDPLATFORM（建置機器自己的架構）跑 npm，交叉建置時不必經過
-# QEMU 模擬。產物照樣能在目標架構的 node 上跑。
-FROM --platform=$BUILDPLATFORM node:22-alpine AS mcp
-ARG MCP_FS_VERSION
-WORKDIR /opt/mcp
-RUN npm install --omit=dev --no-audit --no-fund \
-        "@modelcontextprotocol/server-filesystem@${MCP_FS_VERSION}" \
-    && test -x /opt/mcp/node_modules/.bin/mcp-server-filesystem
-
 # ---------------------------------------------------------------------------
 FROM nousresearch/hermes-agent:${HERMES_VERSION}
 
 # ARG 在 FROM 之後要重新宣告才看得到。拿來打 label，讓 `make version` 能問出
 # 「這個映像到底是用哪個上游版本建的」，而不是只能相信 .env 現在的內容。
 ARG HERMES_VERSION
-ARG MCP_FS_VERSION
 LABEL org.opencontainers.image.base.name="nousresearch/hermes-agent:${HERMES_VERSION}" \
-      hermes.upstream.version="${HERMES_VERSION}" \
-      hermes.mcp.filesystem.version="${MCP_FS_VERSION}"
+      hermes.upstream.version="${HERMES_VERSION}"
 
 # ---------------------------------------------------------------------------
 # 寫入沙箱範圍
 # ---------------------------------------------------------------------------
 # 維持上游預設 HERMES_WRITE_SAFE_ROOT=/opt/data —— agent 原生的 write_file /
-# patch 工具碰不到資料卷以外的路徑。外部資料夾的存取改由 MCP filesystem
-# server 負責（見下一段），那是規格指定的路徑。
+# patch 工具碰不到資料卷以外的路徑。
 #
-# 這個變數支援用 os.pathsep（Linux 上是 ":"）分隔多個根目錄。要恢復「原生
-# 工具也能寫 /workspace」的舊行為，在 .env 裡設
-# HERMES_WRITE_SAFE_ROOT=/opt/data:/workspace，compose 會覆寫這個預設值。
+# 外部資料夾的存取走 hermes-mcp-fs（獨立容器裡的 remote MCP server）。這裡
+# 沒有 /workspace 可以寫，不是因為政策設定，而是因為那個掛載點根本不在這個
+# 容器裡 —— 把 /workspace 加進這個變數也變不出檔案來。
 ENV HERMES_WRITE_SAFE_ROOT=/opt/data
-
-# ---------------------------------------------------------------------------
-# MCP filesystem server（操作外部資料夾的路徑）
-# ---------------------------------------------------------------------------
-# 從 mcp stage 整包搬過來。stdio 傳輸 —— hermes 需要時把它當子行程啟動，
-# 講完 MCP handshake 就註冊出 mcp__workspace-fs__* 這組工具。
-#
-# 沒有對外開埠、沒有常駐行程：不用的時候它根本沒在跑。
-#
-# 實際要開放哪些目錄，是由 /opt/data/config.yaml 的 mcp_servers 區塊傳給它的
-# 位置參數決定（範本見 examples/config.vllm.yaml）。server 只接受那份清單裡
-# 的路徑，其餘一律拒絕 —— 這是 MCP 這條路徑上的授權邊界。
-#
-# 0755 / root 所有：agent（hermes 使用者）執行得了，但改不動 server 自己的
-# 程式碼。
-COPY --from=mcp --chown=root:root --chmod=0755 /opt/mcp /opt/mcp
-ENV HERMES_MCP_FS_BIN=/opt/mcp/node_modules/.bin/mcp-server-filesystem
 
 # ---------------------------------------------------------------------------
 # Dashboard（可從遠端連接）
@@ -110,10 +71,12 @@ ENV HERMES_DASHBOARD=1 \
 # os.walk(followlinks=True) 走遍整個 skills 目錄，版本庫若在掃描範圍內，
 # 保留的每一個歷史版本都會被當成一個獨立的線上技能。
 #
+# 這裡刻意「沒有」/workspace —— 外部資料夾只掛在 hermes-mcp-fs 容器裡。
+#
 # 屬主設成 10000:10000（映像內建的 hermes 使用者）。若透過 HERMES_UID /
 # HERMES_GID 改用其他 UID，上游的 stage2-hook 開機時會重新 chown。
-RUN mkdir -p /workspace /opt/data/skills/evolved /opt/data/skill-versions \
-    && chown -R 10000:10000 /workspace /opt/data/skills /opt/data/skill-versions
+RUN mkdir -p /opt/data/skills/evolved /opt/data/skill-versions \
+    && chown -R 10000:10000 /opt/data/skills /opt/data/skill-versions
 
 # ---------------------------------------------------------------------------
 # 健康檢查

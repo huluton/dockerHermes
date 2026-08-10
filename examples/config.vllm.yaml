@@ -56,28 +56,27 @@ model:
 # ---------------------------------------------------------------------------
 # MCP —— 操作外部資料夾
 # ---------------------------------------------------------------------------
-# runtime 映像在建置階段就裝好了一個 MCP filesystem server（stdio 傳輸），
-# 這裡把它接起來。hermes 會在需要時把它當子行程啟動，工具以
-# mcp__workspace-fs__<tool> 的名稱出現（read_file、write_file、list_directory、
-# move_file、search_files…）。
+# 使用者的外部資料夾「不在」這個容器裡。它掛在 hermes-mcp-fs 這個獨立容器
+# 中，那裡跑著一個 remote MCP filesystem server（Streamable HTTP）。這裡設定
+# 的是「連到哪」，工具以 mcp__workspace-fs__<tool> 的名稱出現
+# （read_text_file、write_file、list_directory、move_file、search_files…）。
 #
-# args 裡列出的目錄就是「允許的根目錄」清單 —— server 會拒絕清單以外的任何
-# 路徑。/workspace 是 .env 的 WORKSPACE_DIR 掛進來的宿主機目錄。
-#
-# 要開放第二個資料夾：先在 docker-compose.override.yml 把宿主機目錄 bind 進
-# 容器，再在下面 args 多加一行容器內的路徑。
+# 允許存取哪些目錄「不是」在這裡決定的 —— 那是 mcp-fs 容器的 MCP_FS_ROOTS
+# 加上它的 bind mount 決定的（見 .env 與 docker-compose.yml）。這份設定拿不到
+# 清單以外的任何檔案，就算改壞也一樣。
 #
 # 改完不必重啟容器 —— 在對話裡下 /reload-mcp 會重新連線並更新工具清單。
+# 但如果動到的是資料夾清單（MCP_FS_ROOTS / bind mount），那要
+# `docker compose up -d hermes-mcp-fs` 讓那個容器重建。
 mcp_servers:
   workspace-fs:
-    # 這個路徑由 runtime 映像固定下來，也可以寫成 "${HERMES_MCP_FS_BIN}"
-    # （hermes 會在連線時展開環境變數）。這裡用字面值，方便直接 grep 到。
-    command: "/opt/mcp/node_modules/.bin/mcp-server-filesystem"
-    args:
-      - "/workspace"
-      # - "/projects"
+    # 主機名是 compose 的服務名，埠是 .env 的 MCP_FS_PORT。也可以寫成
+    # "${HERMES_MCP_FS_URL}"（compose 會把這個變數注入 runtime，hermes 在
+    # 連線時展開）—— 那樣改埠號就不必同時改這裡。這裡用字面值，方便直接
+    # grep 到，也方便看出它是「跨容器」而不是本機子行程。
+    url: "http://hermes-mcp-fs:9300/mcp"
 
-    # 握手與單次工具呼叫的逾時（秒）。
+    # 連線與單次工具呼叫的逾時（秒）。
     connect_timeout: 60
     timeout: 120
 
