@@ -112,7 +112,7 @@ services:
       - mcp-net
 
     depends_on:
-      # mcp-fs 沒起來的話，agent 的 mcp__workspace-fs__* 工具會整組消失
+      # mcp-fs 沒起來的話，agent 的 mcp_workspace_fs_* 工具會整組消失
       # （hermes 連不上就跳過那個 server）。等它 healthy 再啟動 runtime，
       # 省掉一輪「工具怎麼不見了 → /reload-mcp」。
       hermes-mcp-fs:

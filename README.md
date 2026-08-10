@@ -215,8 +215,10 @@ mcp_servers:
 ```
 
 `make seed-config` 種進去的範本已經含這一段，不用自己加。工具會以
-`mcp__workspace-fs__read_text_file`、`mcp__workspace-fs__write_file`、
-`mcp__workspace-fs__list_directory`… 的名稱出現在 agent 的工具清單裡。
+`mcp_workspace_fs_read_text_file`、`mcp_workspace_fs_write_file`、
+`mcp_workspace_fs_list_directory`… 的名稱出現在 agent 的工具清單裡。命名規則是
+`mcp_{server}_{tool}`，其中連字號與點會被換成底線 —— 所以 server 叫
+`workspace-fs`，前綴是 `mcp_workspace_fs_`。
 
 **這是容器邊界，不是工具層的君子協定。** 三道各自獨立的限制：
 
@@ -238,8 +240,15 @@ MCP 握手並讀到檔案、再要求 `/etc/passwd` 確認被拒。
 MCP_FS_ROOTS=/workspace
 ```
 
-改 `config.yaml` 不用重啟容器 —— 在對話裡下 `/reload-mcp`，hermes 會重新連線
-並更新工具清單。但改資料夾清單要重建 mcp-fs 容器（下面第二步）。
+改 `config.yaml` 不用重啟容器 —— 在 dashboard 的對話面板下 `/reload-mcp`，
+hermes 會重新連線並更新工具清單（它會先問一次，因為這會讓 prompt cache 失效；
+回 `/reload-mcp now` 確認）。不放心就 `docker compose restart hermes-runtime`，
+效果一樣。改資料夾清單則要重建 mcp-fs 容器（下面第二步）。
+
+⚠️ hermes 自己也會寫 `config.yaml`（dashboard 改設定、版本遷移都會觸發），寫
+回去的是 YAML dump —— **範本裡的註解會被清掉**。設定值本身不會掉（它會保留使
+用者明確設過的每一個 key，`mcp_servers` 也在內），但別把註解當成長期文件，要
+留備忘請寫在 repo 裡。
 
 **開放第二個資料夾**：加一條 bind，再把容器內路徑補進 `MCP_FS_ROOTS`。
 
@@ -706,11 +715,25 @@ agent 本身讀得到 —— 被 prompt injection 誘導時就有外洩的可能
 **Agent 看到同一個技能的好幾個版本** — 版本庫被掛進了掃描樹裡。確認
 `SKILL_VERSIONS_DIR` 在 `/opt/data/skills` 之外。`config.py` 啟動時會擋這種設定。
 
-**Agent 的工具清單裡沒有 `mcp__workspace-fs__*`** — `config.yaml` 裡缺
+**Agent 的工具清單裡沒有 `mcp_workspace_fs_*`** — `config.yaml` 裡缺
 `mcp_servers` 區塊。既有的資料卷不會因為範本更新而自動跟著改：用
 `make edit-config` 手動補上（內容抄 `examples/config.vllm.yaml`），或
 `make seed-config FORCE=1` 重種一份（會先備份）。補完在對話裡下 `/reload-mcp`。
 `make verify` 第 7 節會檢查這件事。
+
+這是最常見的一種「MCP 壞掉」，而且症狀很容易誤導 —— 不是連線失敗、不是權限被
+拒，是那組工具**根本沒出現**。從舊資料卷升上來的人尤其會遇到：`seed-config`
+預設不覆蓋既有的 `config.yaml`，所以範本更新過幾輪，你的資料卷裡還是最初那份。
+直接確認：
+
+```bash
+docker compose exec hermes-runtime grep -c '^mcp_servers:' /opt/data/config.yaml
+```
+
+**Log 出現「MCP SDK not available」** — 上游映像裡少了選用的 `mcp` Python 套件，
+hermes 會**靜默**跳過整個 MCP 探索（設定沒錯、server 也活著，就是沒有工具）。
+`make verify` 第 7 節會直接驗 `import mcp.client.streamable_http`。這是上游映像
+的相依，換 `HERMES_VERSION` 之後值得重跑一次 verify。
 
 **MCP 工具回「path outside allowed directories」** — 目標路徑不在 `.env` 的
 `MCP_FS_ROOTS` 清單裡。那是預期的拒絕，不是故障；要開放就給 `hermes-mcp-fs`
@@ -724,7 +747,7 @@ agent 本身讀得到 —— 被 prompt injection 誘導時就有外洩的可能
 裡了 —— 改成 `url:`（範本見 `examples/config.vllm.yaml`）。
 
 **agent 說它看不到 `/workspace`** — 那是對的。runtime 容器裡沒有這個目錄，
-外部資料夾只能透過 `mcp__workspace-fs__*` 這組工具存取。如果 agent 一直想用
+外部資料夾只能透過 `mcp_workspace_fs_*` 這組工具存取。如果 agent 一直想用
 terminal 去 `ls /workspace`，在 `config.yaml` 的 system prompt 或技能說明裡
 講清楚要用 MCP 工具。
 

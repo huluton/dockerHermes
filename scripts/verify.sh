@@ -401,7 +401,19 @@ else
     soft "分辨不出 MCP server 對 /etc/passwd 的回應" "$(printf '%s' "$deny_line" | head -c 200)"
 fi
 
-# config.yaml 有沒有真的把 server 接起來。沒接的話 agent 那邊看不到 mcp__ 工具。
+# hermes 這一側的前提：mcp 是「選用」相依套件，沒裝的話 MCP 探索會被靜默跳過
+# （log 只留一行 "MCP SDK not available"），而 url: 這種遠端 server 還額外需要
+# mcp.client.streamable_http。兩者缺一，agent 的工具清單就是空的 —— 而上面所有
+# 檢查都還是會過，因為 server 本身沒問題。
+out="$(in_runtime 'python3 -c "import mcp.client.streamable_http" >/dev/null 2>&1 && echo HAVE || echo MISSING')"
+if printf '%s' "$out" | grep -q HAVE; then
+    ok "runtime 的 hermes 有 MCP client SDK（含 streamable_http）"
+else
+    bad "runtime 裡 import 不到 mcp.client.streamable_http" \
+        "hermes 的 MCP 探索會被靜默跳過，agent 完全看不到 MCP 工具。上游映像換版時要重新確認這個相依"
+fi
+
+# config.yaml 有沒有真的把 server 接起來。沒接的話 agent 那邊看不到 mcp_workspace_fs_* 工具。
 out="$(in_runtime 'grep -A12 "^mcp_servers:" /opt/data/config.yaml 2>/dev/null')"
 if printf '%s' "$out" | grep -qE '^[[:space:]]*url:'; then
     ok "config.yaml 的 mcp_servers 已指向 remote MCP server"
