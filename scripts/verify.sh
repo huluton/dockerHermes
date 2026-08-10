@@ -101,6 +101,27 @@ fi
 # ---------------------------------------------------------------------------
 head_ "2. Dashboard 與遠端存取"
 # ---------------------------------------------------------------------------
+# 先確認 runtime 真的接在 hermes-net 上。這不是形式檢查：runtime 同時接兩個
+# 網路，而 mcp-net 是 internal —— 如果 hermes-net 那一條沒接上（compose 中途
+# 被打斷、或網路是別的專案留下來的殘骸），Docker 就無法發佈 9119，宿主機上
+# 根本不會有 listener。症狀是 dashboard 完全連不上，但容器全部 healthy。
+nets="$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' \
+    "hermes-${INSTANCE}-runtime" 2>/dev/null)"
+if printf '%s' "$nets" | grep -qw "hermes-${INSTANCE}-net"; then
+    ok "runtime 接在 hermes-net 上"
+else
+    bad "runtime 沒有接上 hermes-${INSTANCE}-net（目前只在：${nets:-（查不到）}）" \
+        "只剩 internal 網路的話 9119 發佈不出去。修：docker network connect hermes-${INSTANCE}-net hermes-${INSTANCE}-runtime，或 docker compose up -d --force-recreate hermes-runtime"
+fi
+
+published="$(docker port "hermes-${INSTANCE}-runtime" "${DASH_PORT}/tcp" 2>/dev/null)"
+if [ -n "$published" ]; then
+    ok "9119 有發佈到宿主機（$published）"
+else
+    bad "runtime 的 ${DASH_PORT}/tcp 沒有對應的宿主機埠" \
+        "docker ps 只會顯示 ${DASH_PORT}/tcp 而沒有 -> 箭號。多半是上面那條網路沒接上"
+fi
+
 # /api/status 是上游 PUBLIC_API_PATHS 裡標為 liveness probe 的端點，未驗證
 # 也回得了 200。不要換成 /api/health —— v2026.7.20 沒有那個路由。
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
@@ -413,7 +434,7 @@ else
         "hermes 的 MCP 探索會被靜默跳過，agent 完全看不到 MCP 工具。上游映像換版時要重新確認這個相依"
 fi
 
-# config.yaml 有沒有真的把 server 接起來。沒接的話 agent 那邊看不到 mcp_workspace_fs_* 工具。
+# config.yaml 有沒有真的把 server 接起來。沒接的話 agent 那邊看不到 mcp__workspace_fs__* 工具。
 out="$(in_runtime 'grep -A12 "^mcp_servers:" /opt/data/config.yaml 2>/dev/null')"
 if printf '%s' "$out" | grep -qE '^[[:space:]]*url:'; then
     ok "config.yaml 的 mcp_servers 已指向 remote MCP server"

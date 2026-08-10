@@ -215,10 +215,12 @@ mcp_servers:
 ```
 
 `make seed-config` 種進去的範本已經含這一段，不用自己加。工具會以
-`mcp_workspace_fs_read_text_file`、`mcp_workspace_fs_write_file`、
-`mcp_workspace_fs_list_directory`… 的名稱出現在 agent 的工具清單裡。命名規則是
-`mcp_{server}_{tool}`，其中連字號與點會被換成底線 —— 所以 server 叫
-`workspace-fs`，前綴是 `mcp_workspace_fs_`。
+`mcp__workspace_fs__read_text_file`、`mcp__workspace_fs__write_file`、
+`mcp__workspace_fs__list_directory`… 的名稱出現在 agent 的工具清單裡。命名規則是
+`mcp__{server}__{tool}`，其中 `[A-Za-z0-9_]` 以外的字元（含連字號）會被換成
+底線 —— 所以 server 叫 `workspace-fs`，前綴是 `mcp__workspace_fs__`。啟動時
+`docker compose logs hermes-runtime | grep "registered"` 會列出實際註冊的
+14 個工具名稱。
 
 **這是容器邊界，不是工具層的君子協定。** 三道各自獨立的限制：
 
@@ -706,6 +708,24 @@ agent 本身讀得到 —— 被 prompt injection 誘導時就有外洩的可能
 **`docker compose up` 直接失敗，說 `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD` 必須設定**
 — 這是刻意的。`.env` 裡填一組密碼（`openssl rand -base64 24`）。
 
+**Dashboard 完全連不上，但 `docker ps` 顯示每個容器都 healthy** — 先看 `docker ps`
+的 PORTS 欄。正常是 `0.0.0.0:9119->9119/tcp`；如果只有 `9119/tcp`（沒有箭號），
+代表這個埠**根本沒發佈**，宿主機上不會有 listener。
+
+原因幾乎都是同一個：runtime 同時接 `hermes-net` 與 `mcp-net`，而 `mcp-net` 是
+`internal: true`。要是 `hermes-net` 那一條沒接上（`docker compose up` 中途被
+打斷、或那個網路是同名舊專案留下來的殘骸），容器就只剩一條沒有對外路由的網
+路，Docker 發佈不了埠 —— 但容器本身照跑、healthcheck 走 loopback 也照樣過。
+
+```bash
+docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' hermes-1-runtime
+docker network connect hermes-1-net hermes-1-runtime      # 立即修，不必重啟
+```
+
+要根治就把那條網路重建（`docker compose down && make up`）。注意 `docker compose
+up -d` **不會**自己補上缺的網路連線 —— 它看到容器在跑就跳過了。`make verify`
+第 2 節現在會直接檢查這兩件事。
+
 **Dashboard 連得上但所有頁面都回錯誤** — auth provider 沒生效。
 `docker compose exec hermes-runtime env | grep DASHBOARD` 確認密碼真的傳進去了。
 
@@ -715,7 +735,7 @@ agent 本身讀得到 —— 被 prompt injection 誘導時就有外洩的可能
 **Agent 看到同一個技能的好幾個版本** — 版本庫被掛進了掃描樹裡。確認
 `SKILL_VERSIONS_DIR` 在 `/opt/data/skills` 之外。`config.py` 啟動時會擋這種設定。
 
-**Agent 的工具清單裡沒有 `mcp_workspace_fs_*`** — `config.yaml` 裡缺
+**Agent 的工具清單裡沒有 `mcp__workspace_fs__*`** — `config.yaml` 裡缺
 `mcp_servers` 區塊。既有的資料卷不會因為範本更新而自動跟著改：用
 `make edit-config` 手動補上（內容抄 `examples/config.vllm.yaml`），或
 `make seed-config FORCE=1` 重種一份（會先備份）。補完在對話裡下 `/reload-mcp`。
@@ -747,7 +767,7 @@ hermes 會**靜默**跳過整個 MCP 探索（設定沒錯、server 也活著，
 裡了 —— 改成 `url:`（範本見 `examples/config.vllm.yaml`）。
 
 **agent 說它看不到 `/workspace`** — 那是對的。runtime 容器裡沒有這個目錄，
-外部資料夾只能透過 `mcp_workspace_fs_*` 這組工具存取。如果 agent 一直想用
+外部資料夾只能透過 `mcp__workspace_fs__*` 這組工具存取。如果 agent 一直想用
 terminal 去 `ls /workspace`，在 `config.yaml` 的 system prompt 或技能說明裡
 講清楚要用 MCP 工具。
 

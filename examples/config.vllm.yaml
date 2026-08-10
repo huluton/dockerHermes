@@ -58,7 +58,7 @@ model:
 # ---------------------------------------------------------------------------
 # 使用者的外部資料夾「不在」這個容器裡。它掛在 hermes-mcp-fs 這個獨立容器
 # 中，那裡跑著一個 remote MCP filesystem server（Streamable HTTP）。這裡設定
-# 的是「連到哪」，工具以 mcp_workspace_fs_<tool> 的名稱出現
+# 的是「連到哪」，工具以 mcp__workspace_fs__<tool> 的名稱出現
 # （read_text_file、write_file、list_directory、move_file、search_files…）。
 #
 # 允許存取哪些目錄「不是」在這裡決定的 —— 那是 mcp-fs 容器的 MCP_FS_ROOTS
