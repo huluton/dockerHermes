@@ -7,26 +7,78 @@
 # 為 root 所有且對 agent 唯讀）、修補過 WAL bug 的 SQLite、Node 22、
 # Playwright chromium，並且已發佈 linux/amd64 與 linux/arm64 兩種架構。
 #
-# 我們在這裡做的只有「設定」，不安裝任何套件 — 這正是「絕不在 Runtime
-# 容器內執行 pip install」這條原則。所有需要安裝依賴的
-# 進化工作都發生在 hermes-sandbox 這個短暫容器裡。
+# 我們在這裡做的只有「設定」，外加一份在建置階段就固定下來的 MCP filesystem
+# server（見下面的 mcp stage）—— 執行期不安裝任何東西，這正是「絕不在
+# Runtime 容器內執行 pip install」這條原則。所有需要安裝依賴的進化工作都發生
+# 在 hermes-sandbox 這個短暫容器裡。
 #
-# 版本刻意釘住而非用 :latest：自我進化的 agent 已經有夠多變動來源了，
-# 底層 runtime 不該是其中之一。升級請改 .env 的 HERMES_VERSION。
+# 版本預設釘住而非用 :latest：自我進化的 agent 已經有夠多變動來源了，底層
+# runtime 不該是其中之一。要更新到最新版：改 .env 的 HERMES_VERSION（填
+# 具體標籤或 latest 都可以）再 `make update`，細節見 README 的
+# 「6. 更新到最新版」。
 ARG HERMES_VERSION=v2026.7.20
+
+# MCP filesystem server 的版本，同樣釘住。查最新版：
+#     npm view @modelcontextprotocol/server-filesystem version
+ARG MCP_FS_VERSION=2026.7.10
+
+# ---------------------------------------------------------------------------
+# mcp stage —— 把 MCP filesystem server 抓下來，之後整包複製進 runtime
+# ---------------------------------------------------------------------------
+# 為什麼不在 runtime 裡直接 `npx -y @modelcontextprotocol/server-filesystem`：
+# npx 會在「agent 第一次呼叫工具」的當下連上 npm registry 下載套件 —— 那是
+# 執行期安裝，離線環境直接失敗，而且每次拉到的內容不保證一樣。改成建置階段
+# 裝好、版本釘死，執行期只是啟動一個本機子行程。
+#
+# 純 JavaScript，沒有原生模組，所以這一層在 amd64 與 arm64 上內容相同 ——
+# 因此固定用 $BUILDPLATFORM（建置機器自己的架構）跑 npm，交叉建置時不必經過
+# QEMU 模擬。產物照樣能在目標架構的 node 上跑。
+FROM --platform=$BUILDPLATFORM node:22-alpine AS mcp
+ARG MCP_FS_VERSION
+WORKDIR /opt/mcp
+RUN npm install --omit=dev --no-audit --no-fund \
+        "@modelcontextprotocol/server-filesystem@${MCP_FS_VERSION}" \
+    && test -x /opt/mcp/node_modules/.bin/mcp-server-filesystem
+
+# ---------------------------------------------------------------------------
 FROM nousresearch/hermes-agent:${HERMES_VERSION}
+
+# ARG 在 FROM 之後要重新宣告才看得到。拿來打 label，讓 `make version` 能問出
+# 「這個映像到底是用哪個上游版本建的」，而不是只能相信 .env 現在的內容。
+ARG HERMES_VERSION
+ARG MCP_FS_VERSION
+LABEL org.opencontainers.image.base.name="nousresearch/hermes-agent:${HERMES_VERSION}" \
+      hermes.upstream.version="${HERMES_VERSION}" \
+      hermes.mcp.filesystem.version="${MCP_FS_VERSION}"
 
 # ---------------------------------------------------------------------------
 # 寫入沙箱範圍
 # ---------------------------------------------------------------------------
-# 上游映像預設 HERMES_WRITE_SAFE_ROOT=/opt/data，也就是 agent 的 write_file /
-# patch 工具完全無法碰到資料卷以外的路徑。但 runtime 要能用
-# terminal 操作外部掛進來的 /workspace，所以這裡把 /workspace 加進安全根。
+# 維持上游預設 HERMES_WRITE_SAFE_ROOT=/opt/data —— agent 原生的 write_file /
+# patch 工具碰不到資料卷以外的路徑。外部資料夾的存取改由 MCP filesystem
+# server 負責（見下一段），那是規格指定的路徑。
 #
-# 這個變數支援用 os.pathsep（Linux 上是 ":"）分隔多個根目錄。列出的根之外
-# 一律硬性拒絕，不會跳核准提示。憑證類路徑（~/.ssh/id_rsa 之類）即使在安全
-# 根內部仍然被上游的 denylist 擋住，這點不受影響。
-ENV HERMES_WRITE_SAFE_ROOT=/opt/data:/workspace
+# 這個變數支援用 os.pathsep（Linux 上是 ":"）分隔多個根目錄。要恢復「原生
+# 工具也能寫 /workspace」的舊行為，在 .env 裡設
+# HERMES_WRITE_SAFE_ROOT=/opt/data:/workspace，compose 會覆寫這個預設值。
+ENV HERMES_WRITE_SAFE_ROOT=/opt/data
+
+# ---------------------------------------------------------------------------
+# MCP filesystem server（操作外部資料夾的路徑）
+# ---------------------------------------------------------------------------
+# 從 mcp stage 整包搬過來。stdio 傳輸 —— hermes 需要時把它當子行程啟動，
+# 講完 MCP handshake 就註冊出 mcp__workspace-fs__* 這組工具。
+#
+# 沒有對外開埠、沒有常駐行程：不用的時候它根本沒在跑。
+#
+# 實際要開放哪些目錄，是由 /opt/data/config.yaml 的 mcp_servers 區塊傳給它的
+# 位置參數決定（範本見 examples/config.vllm.yaml）。server 只接受那份清單裡
+# 的路徑，其餘一律拒絕 —— 這是 MCP 這條路徑上的授權邊界。
+#
+# 0755 / root 所有：agent（hermes 使用者）執行得了，但改不動 server 自己的
+# 程式碼。
+COPY --from=mcp --chown=root:root --chmod=0755 /opt/mcp /opt/mcp
+ENV HERMES_MCP_FS_BIN=/opt/mcp/node_modules/.bin/mcp-server-filesystem
 
 # ---------------------------------------------------------------------------
 # Dashboard（可從遠端連接）
@@ -40,13 +92,6 @@ ENV HERMES_WRITE_SAFE_ROOT=/opt/data:/workspace
 ENV HERMES_DASHBOARD=1 \
     HERMES_DASHBOARD_HOST=0.0.0.0 \
     HERMES_DASHBOARD_PORT=9119
-
-# ---------------------------------------------------------------------------
-# camofox 瀏覽器 sidecar
-# ---------------------------------------------------------------------------
-# 指向同一個 hermes-net 上的服務名稱。camofox 沒起來時上游會退回其他瀏覽器
-# 後端，所以即使沒啟用 browser profile 這個設定也無害。
-ENV CAMOFOX_URL=http://camofox:9377
 
 # ---------------------------------------------------------------------------
 # 掛載點

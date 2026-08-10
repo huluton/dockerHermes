@@ -4,8 +4,7 @@
 #
 #   hermes-net（應用層）
 #     hermes-runtime  ◄──►  hermes-controller  ◄──►  hermes-sandbox（動態建立）
-#            │                      │
-#            └──► camofox           │
+#                                   │
 #                                   ▼
 #   docker-control-net（internal: true，對外完全隔離）
 #                          docker-socket-proxy ──► /var/run/docker.sock
@@ -27,7 +26,7 @@ name: hermes-${INSTANCE:-default}
 # 網路
 # ---------------------------------------------------------------------------
 networks:
-  # 應用層。runtime、controller、camofox、以及短暫的 sandbox 都在這裡。
+  # 應用層。runtime、controller、以及短暫的 sandbox 都在這裡。
   hermes-net:
     name: hermes-${INSTANCE:-default}-net
 
@@ -79,7 +78,10 @@ services:
     build:
       context: ./runtime
       args:
+        # 填具體標籤（v2026.7.20）或 latest 都可以。更新流程見 `make update`。
         HERMES_VERSION: ${HERMES_VERSION:-v2026.7.20}
+        # 建置階段裝進映像的 MCP filesystem server 版本。
+        MCP_FS_VERSION: ${MCP_FS_VERSION:-2026.7.10}
     image: hermes-runtime:${INSTANCE:-default}
     container_name: hermes-${INSTANCE:-default}-runtime
     restart: unless-stopped
@@ -115,8 +117,12 @@ services:
       # 版本庫，唯讀。evolved/ 裡的 symlink 指向這裡，沒掛就全部斷掉。
       - hermes-versions:/opt/data/skill-versions:ro
 
-      # 讓 runtime 的 terminal 能操作外部掛進來的 /workspace 資料夾。
-      # 搭配 runtime/Dockerfile 的 HERMES_WRITE_SAFE_ROOT=/opt/data:/workspace。
+      # 外部資料夾。agent 透過 MCP filesystem server 操作這裡 ——
+      # config.yaml 的 mcp_servers.workspace-fs 把 /workspace 列為允許根目錄。
+      #
+      # WORKSPACE_DIR 可以指到宿主機上任何路徑（例如 /home/me/projects）。
+      # 要開放第二個資料夾：加一條 bind 再把容器內路徑補進 mcp_servers 的
+      # args，見 README 的「3. 透過 MCP 操作外部資料夾」。
       - ${WORKSPACE_DIR:-./workspace}:/workspace
 
       # GCP service account 憑證，唯讀。目錄裡沒放 JSON 的話整段是 no-op ——
@@ -136,6 +142,11 @@ services:
       # 把內建的 hermes 使用者重新映射到這組 UID/GID。
       HERMES_UID: ${HERMES_UID:-10000}
       HERMES_GID: ${HERMES_GID:-10000}
+
+      # agent 原生 write_file / patch 工具的可寫範圍。預設只有資料卷 ——
+      # 外部資料夾走 MCP filesystem server（見上面 /workspace 的掛載註解）。
+      # 要恢復「原生工具也能寫 /workspace」，在 .env 裡設成 /opt/data:/workspace。
+      HERMES_WRITE_SAFE_ROOT: ${HERMES_WRITE_SAFE_ROOT:-/opt/data}
 
       # Dashboard 的 basic auth。上游 2026 年 6 月的強化之後，只要綁定位址
       # 不是 loopback，dashboard 就強制要求一個 auth provider，否則 fail
@@ -309,41 +320,6 @@ services:
     # privileged 容器或掛載宿主機路徑，藉此逃逸。它確實擋掉了 Swarm /
     # Secrets / Networks / Configs（白名單之外一律拒絕），但不該被當成
     # 「即使 controller 被攻陷也安全」的保證。
-
-  # =========================================================================
-  # camofox —— 反偵測瀏覽器 sidecar
-  # =========================================================================
-  #
-  # 放在 browser profile 底下，預設的 `docker compose up` 不會拉這個映像
-  # （解壓後約 3.5GB，裡面有一整套 Camoufox/Firefox）。要啟用：
-  #     docker compose --profile browser up -d
-  camofox:
-    profiles: ["browser"]
-    # 上游有發佈多架構映像（amd64 + arm64），不需要自建。版本釘住，理由與
-    # HERMES_VERSION 相同。
-    #
-    # 要改用原始碼建置的話（例如要打 patch），把 image 換成：
-    #     build:
-    #       context: https://github.com/jo-inc/camofox-browser.git#master
-    #       dockerfile: Dockerfile.ci
-    # default branch 是 master 不是 main，而且建置時會下載數百 MB 的 binary。
-    image: ghcr.io/jo-inc/camofox-browser:${CAMOFOX_VERSION:-1.13.0}
-    container_name: hermes-${INSTANCE:-default}-camofox
-    restart: unless-stopped
-
-    networks:
-      - hermes-net
-
-    ports:
-      # 預設只綁 loopback —— 這是個能任意連外的瀏覽器，不該直接曝在 LAN 上。
-      - "${CAMOFOX_BIND:-127.0.0.1}:${CAMOFOX_PORT:-9377}:9377"
-
-    environment:
-      CAMOFOX_PORT: 9377
-      MAX_OLD_SPACE_SIZE: ${CAMOFOX_HEAP_MB:-512}
-
-    # Firefox 需要比 Docker 預設的 64MB 更大的 /dev/shm，否則分頁會隨機崩潰。
-    shm_size: ${CAMOFOX_SHM_SIZE:-1gb}
 
 # ---------------------------------------------------------------------------
 # hermes-sandbox 為什麼不在這裡

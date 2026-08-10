@@ -54,6 +54,48 @@ model:
   temperature: 0.7
 
 # ---------------------------------------------------------------------------
+# MCP —— 操作外部資料夾
+# ---------------------------------------------------------------------------
+# runtime 映像在建置階段就裝好了一個 MCP filesystem server（stdio 傳輸），
+# 這裡把它接起來。hermes 會在需要時把它當子行程啟動，工具以
+# mcp__workspace-fs__<tool> 的名稱出現（read_file、write_file、list_directory、
+# move_file、search_files…）。
+#
+# args 裡列出的目錄就是「允許的根目錄」清單 —— server 會拒絕清單以外的任何
+# 路徑。/workspace 是 .env 的 WORKSPACE_DIR 掛進來的宿主機目錄。
+#
+# 要開放第二個資料夾：先在 docker-compose.override.yml 把宿主機目錄 bind 進
+# 容器，再在下面 args 多加一行容器內的路徑。
+#
+# 改完不必重啟容器 —— 在對話裡下 /reload-mcp 會重新連線並更新工具清單。
+mcp_servers:
+  workspace-fs:
+    # 這個路徑由 runtime 映像固定下來，也可以寫成 "${HERMES_MCP_FS_BIN}"
+    # （hermes 會在連線時展開環境變數）。這裡用字面值，方便直接 grep 到。
+    command: "/opt/mcp/node_modules/.bin/mcp-server-filesystem"
+    args:
+      - "/workspace"
+      # - "/projects"
+
+    # 握手與單次工具呼叫的逾時（秒）。
+    connect_timeout: 60
+    timeout: 120
+
+    tools:
+      # 這個 server 不提供 prompt / resource，關掉可以少兩輪探測。
+      prompts: false
+      resources: false
+
+      # 只想要唯讀存取的話，把 include 打開（未列出的工具不會註冊）：
+      # include:
+      #   - read_text_file
+      #   - read_multiple_files
+      #   - list_directory
+      #   - directory_tree
+      #   - search_files
+      #   - get_file_info
+
+# ---------------------------------------------------------------------------
 # 進化出來的技能
 # ---------------------------------------------------------------------------
 # controller 晉升的技能會出現在 /opt/data/skills/evolved/ 底下（唯讀掛載），

@@ -9,8 +9,7 @@
         │                                                                   │
         │   hermes-runtime  ◄────────►  hermes-controller  ◄────►  sandbox  │
         │   :9119 Dashboard             :9200（不對外）           （短暫）  │
-        │        │                              │                           │
-        │        └──► camofox :9377             │                           │
+        │   + MCP filesystem                    │                           │
         └───────────────────────────────────────┼───────────────────────────┘
                                                 │
         ┌───────────────────────────────────────▼───────────────────────────┐
@@ -59,10 +58,10 @@ openssl rand -base64 24       # 產一組
 ```
 .
 ├── spec.md                    架構規格
-├── docker-compose.yml         五個服務、兩個網路、四個卷
+├── docker-compose.yml         三個服務、兩個網路、四個卷
 ├── .env.example               所有可調參數
 ├── Makefile                   操作入口
-├── runtime/Dockerfile         FROM 上游官方映像，只做設定
+├── runtime/Dockerfile         FROM 上游官方映像；設定 + 內建 MCP filesystem server
 ├── controller/                進化生命週期管理（本專案自己寫的部分）
 │   ├── Dockerfile
 │   ├── entrypoint.sh          root 起 → chown 卷 → setpriv 降權
@@ -86,11 +85,11 @@ openssl rand -base64 24       # 產一組
 
 ---
 
-## 五個設計原則怎麼落實
+## 設計原則
 
 | 原則 | 落實方式 | 怎麼驗 |
 |---|---|---|
-| **正式環境穩定** | 技能卷與版本庫對 runtime 以 `:ro` 掛載；runtime 層只 `FROM` 上游映像做設定，不裝任何套件 | `make verify` 第 3 節 |
+| **正式環境穩定** | 技能卷與版本庫對 runtime 以 `:ro` 掛載；runtime 層只 `FROM` 上游映像做設定，執行期不安裝任何東西（MCP server 是建置階段裝好、版本釘死的） | `make verify` 第 3、7 節 |
 | **沙箱隔離** | 每個任務一個獨立容器，`CapDrop: ALL`、`no-new-privileges`、記憶體/CPU/PID 上限、`/tmp` 用 tmpfs、逾時強制 kill、`finally` 明確移除，另有孤兒回收器兜底 | `make test`（15 個 sandbox 測試）＋ `make verify FULL=1` |
 | **最小特權** | Controller 沒有 `docker.sock`，所有 Docker 存取都經過 socket-proxy 的白名單；Swarm / Network / Secret 一律 `0` | `make verify` 第 5 節 |
 | **原子性晉升** | 新版本完整寫進版本庫 → `fsync` → `os.replace()` 換 symlink。Runtime 看到的永遠是「完整的舊版」或「完整的新版」 | `make test`（39 個 promote 測試） |
@@ -121,7 +120,7 @@ symlink 是原子的。
 
 ---
 
-## 五項需求怎麼滿足
+## 特色
 
 ### 1. 多個獨立的 Hermes agents
 
@@ -132,14 +131,18 @@ symlink 是原子的。
 cp -r hermes_1 hermes_2 && cd hermes_2
 sed -i 's/^INSTANCE=.*/INSTANCE=research/' .env
 sed -i 's/^DASHBOARD_PORT=.*/DASHBOARD_PORT=9120/' .env
-sed -i 's/^CAMOFOX_PORT=.*/CAMOFOX_PORT=9378/' .env
 make build && make up
 ```
 
 兩套完全不共用任何卷或網路。Controller 的孤兒容器回收器依
 `hermes.instance` label 過濾，所以 A 的清理絕不會砍掉 B 正在跑的沙箱。
 
-唯一共用的是宿主機的 Docker daemon 與埠號空間 —— 記得把**所有**埠都改掉。
+唯一共用的是宿主機的 Docker daemon 與埠號空間 —— 記得把**所有**對外發佈的埠
+都改掉。目前只有 Dashboard 這一個（`DASHBOARD_PORT`）；controller 刻意不發佈
+埠，MCP filesystem server 走 stdio 也不佔埠。
+
+`WORKSPACE_DIR` 預設是相對路徑 `./workspace`，兩套各自解析到自己的目錄，
+不會撞在一起。要讓兩套共用同一個外部資料夾就把它指到同一個絕對路徑。
 
 ### 2. 外接地端 vLLM
 
@@ -185,18 +188,68 @@ vLLM 沒開驗證的話 `api_key` 填 `"none"` —— 不能留空，OpenAI 相�
 不想自己跑模型的話，另一條路是走 Google Cloud 的 Vertex AI ——
 見下面的「用 Vertex AI（GCP）當推論後端」。
 
-### 3. Runtime 的 terminal 操作外部資料夾
+### 3. 透過 MCP 操作外部資料夾
 
-宿主機的 `WORKSPACE_DIR`（預設 `./workspace`）以 rw 掛在容器內的 `/workspace`，
-並且 `runtime/Dockerfile` 把它加進了 `HERMES_WRITE_SAFE_ROOT`：
+宿主機的 `WORKSPACE_DIR`（預設 `./workspace`，可以指到任何路徑）以 rw 掛在
+容器內的 `/workspace`。Agent 操作它的方式是 **MCP**：runtime 映像裡裝了一個
+MCP filesystem server，由 `config.yaml` 的 `mcp_servers` 接起來。
 
-```dockerfile
-ENV HERMES_WRITE_SAFE_ROOT=/opt/data:/workspace
+```yaml
+mcp_servers:
+  workspace-fs:
+    command: "/opt/mcp/node_modules/.bin/mcp-server-filesystem"
+    args:
+      - "/workspace"
+    connect_timeout: 60
+    timeout: 120
+    tools:
+      prompts: false
+      resources: false
 ```
 
-這個變數支援用 `:` 分隔多個根目錄。列出的根之外一律硬性拒絕（不是跳核准提示，
-是直接擋）。憑證類路徑（`~/.ssh/id_rsa` 之類）即使在安全根內部仍然被上游的
-denylist 擋住。
+`make seed-config` 種進去的範本已經含這一段，不用自己加。工具會以
+`mcp__workspace-fs__read_text_file`、`mcp__workspace-fs__write_file`、
+`mcp__workspace-fs__list_directory`… 的名稱出現在 agent 的工具清單裡。
+
+**`args` 列出的目錄就是允許清單。** server 拒絕清單以外的任何路徑（含用
+symlink 繞出去），這是 MCP 這條路徑上的授權邊界。`make verify` 第 7 節會實際
+跑一次 handshake，再要求它讀 `/etc/passwd` 來確認拒絕真的有效。
+
+改完 `config.yaml` 不用重啟容器 —— 在對話裡下 `/reload-mcp`，hermes 會重新
+連線並更新工具清單。
+
+**開放第二個資料夾**：加一個 bind，再把容器內路徑補進 `args`。
+
+```yaml
+# docker-compose.override.yml
+services:
+  hermes-runtime:
+    volumes:
+      - /srv/datasets:/datasets
+```
+
+```bash
+make edit-config     # 在 mcp_servers.workspace-fs.args 底下加一行 - "/datasets"
+make restart
+```
+
+**為什麼是 build 階段裝，而不是 `npx -y`。** 上游文件示範的
+`command: "npx"` 會在 agent 第一次呼叫工具的當下連 npm registry 下載套件 ——
+那是執行期安裝，離線環境直接失敗，而且每次拉到的內容不保證一樣。這裡改成在
+`runtime/Dockerfile` 的一個 `node:22-alpine` build stage 裝好、版本由
+`MCP_FS_VERSION` 釘死，執行期只是啟動一個本機子行程。
+
+**原生檔案工具預設碰不到 `/workspace`。** `HERMES_WRITE_SAFE_ROOT` 維持上游
+預設的 `/opt/data`，也就是 `write_file` / `patch` 只能寫資料卷 —— 外部資料夾
+統一走 MCP。要回到舊行為（原生工具也能直接寫）就在 `.env` 設：
+
+```bash
+HERMES_WRITE_SAFE_ROOT=/opt/data:/workspace
+```
+
+⚠️ 誠實揭露：這是**工具層**的區隔，不是容器邊界。`/workspace` 是同一個容器裡
+的一個掛載點，terminal 工具在 OS 層還是碰得到它。要真正的隔離，得把資料夾從
+runtime 拿掉、改成獨立容器裡的 remote MCP server —— 那超出本專案目前的範圍。
 
 想讓容器寫出來的檔案在宿主機上屬於你自己：
 
@@ -225,7 +278,9 @@ tunnel / VPN。
 
 所有映像都確認過是多架構的（`docker manifest inspect` 實測 amd64 + arm64
 皆存在）：`nousresearch/hermes-agent`、`python:3.13-slim`、
-`tecnativa/docker-socket-proxy:v0.4.2`、`ghcr.io/jo-inc/camofox-browser`。
+`tecnativa/docker-socket-proxy:v0.4.2`、`node:22-alpine`（只出現在 runtime 的
+build stage 裡）。MCP filesystem server 是純 JavaScript，沒有原生模組，兩個
+架構拿到的內容一樣。
 
 ```bash
 make buildx     # 驗證自建的三個映像都能建出 linux/amd64 + linux/arm64
@@ -252,6 +307,44 @@ docker buildx inspect default | grep Platforms   # 應該要看得到 linux/arm6
 
 在原生的 arm64 機器（Apple silicon、樹莓派、Graviton）上部署不需要這一步 ——
 直接 `make build` 就好，那是原生建置。
+
+### 6. 更新到最新版
+
+```bash
+make update-check     # 列出上游 nousresearch/hermes-agent 最近發佈的標籤
+$EDITOR .env          # 改 HERMES_VERSION
+make update           # 重建（--pull）+ 滾動重啟，卷完全不動
+make version          # .env 要求的版本 / 映像實際建出來的版本 / 執行中的容器
+make verify           # 確認架構在新版上依然成立
+```
+
+`HERMES_VERSION` 填具體標籤（`v2026.7.20`）或 `latest` 都可以。預設是釘住的
+具體標籤 —— 一個會自我進化的 agent 已經有夠多變動來源，底層 runtime 不該
+在你沒按下按鈕的時候自己換版。填 `latest` 的話，每次 `make update` 都會跟到
+上游當下的最新映像。
+
+`make update` 做的事：
+
+| 步驟 | 為什麼 |
+|---|---|
+| `compose build --pull` | `--pull` 是關鍵 —— 沒有它，`latest` 或被重推過的標籤會沿用本機快取的舊 base image，看起來像「更新沒生效」 |
+| `docker build --pull` sandbox | sandbox 不是 compose 服務，得單獨建 |
+| `compose up -d --remove-orphans` | 只重建映像變了的容器；順手清掉舊版本留下、現在已經不在 compose 檔裡的容器 |
+
+**資料不會受影響。** 技能、版本庫、`config.yaml`、sessions、memory、任務
+資料庫全部在具名卷裡（`hermes-<INSTANCE>-{data,skills,versions,state}`），
+更新只換映像。
+
+**退版**：把 `HERMES_VERSION` 改回舊標籤，再跑一次 `make update`。唯一要留意
+的是**資料卷的 schema 不會自動退回** —— 新版若動過 SQLite schema，退版前先備份：
+
+```bash
+docker run --rm -v hermes-default-data:/d -v "$PWD:/b" alpine \
+    tar czf /b/hermes-data-backup.tar.gz -C /d .
+```
+
+同時也可以更新 MCP filesystem server（`.env` 的 `MCP_FS_VERSION`）—— 它是在
+runtime 映像的 build stage 裡裝的，一樣走 `make update`。
 
 ---
 
@@ -493,7 +586,8 @@ Controller 的 API（`hermes-net` 內的 `http://hermes-controller:9200`，
 | `/opt/data/skills/evolved`（線上技能） | **ro** | rw |
 | `/opt/data/skill-versions`（版本庫） | **ro** | rw |
 | `/opt/data`（自身狀態） | rw | 無 |
-| `/workspace` | rw | 無 |
+| `/workspace`（外部資料夾，走 MCP） | rw | 無 |
+| `/opt/mcp`（MCP filesystem server） | ro（root 所有） | 無 |
 
 `make verify` 的第 3 節就是在驗這張表。
 
@@ -566,6 +660,16 @@ agent 本身讀得到 —— 被 prompt injection 誘導時就有外洩的可能
 **Agent 看到同一個技能的好幾個版本** — 版本庫被掛進了掃描樹裡。確認
 `SKILL_VERSIONS_DIR` 在 `/opt/data/skills` 之外。`config.py` 啟動時會擋這種設定。
 
+**Agent 的工具清單裡沒有 `mcp__workspace-fs__*`** — `config.yaml` 裡缺
+`mcp_servers` 區塊。既有的資料卷不會因為範本更新而自動跟著改：用
+`make edit-config` 手動補上（內容抄 `examples/config.vllm.yaml`），或
+`make seed-config FORCE=1` 重種一份（會先備份）。補完在對話裡下 `/reload-mcp`。
+`make verify` 第 7 節會檢查這件事。
+
+**MCP 工具回「path outside allowed directories」** — 目標路徑不在
+`mcp_servers.workspace-fs.args` 的清單裡。那是預期的拒絕，不是故障；要開放
+就加 bind 再加一行 `args`。
+
 **`make evolve` 回 503** — 併發任務數滿了（`MAX_CONCURRENT_TASKS`），或
 controller 連不上 socket-proxy。`make status` 看細節。
 
@@ -596,5 +700,5 @@ python3 -m venv /tmp/hv && /tmp/hv/bin/pip install -q pytest pyyaml
 PYTHONPATH=. /tmp/hv/bin/python -m pytest tests -q
 ```
 
-升級上游 hermes：改 `.env` 的 `HERMES_VERSION`，然後
-`make build && make restart`。技能與狀態都在具名卷裡，不會受影響。
+升級上游 hermes：`make update-check` → 改 `.env` 的 `HERMES_VERSION` →
+`make update`。技能與狀態都在具名卷裡，不會受影響。詳見「6. 更新到最新版」。

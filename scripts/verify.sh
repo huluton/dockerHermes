@@ -292,22 +292,87 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-head_ "7. 外部 workspace"
+head_ "7. 透過 MCP 操作外部資料夾"
 # ---------------------------------------------------------------------------
+# 先確認 bind mount 真的通到宿主機。這一段用容器內的 shell 直接寫，驗的是
+# 掛載本身 —— agent 走的那條路（MCP）在下面單獨驗。
 token="verify-$$-$(date -u +%s)"
 in_runtime "printf '%s' '$token' > /workspace/.verify-probe" >/dev/null
 if [ -f "${WORKSPACE}/.verify-probe" ] && [ "$(cat "${WORKSPACE}/.verify-probe")" = "$token" ]; then
-    ok "runtime 寫入 /workspace，宿主機的 ${WORKSPACE} 看得到"
-    rm -f "${WORKSPACE}/.verify-probe"
+    ok "/workspace 通到宿主機的 ${WORKSPACE}"
 else
     bad "workspace 沒有寫穿到宿主機" "檢查 .env 的 WORKSPACE_DIR 與 compose 的 bind mount"
 fi
 
+# MCP filesystem server 必須在映像裡（建置階段裝的），而且是 root 所有 ——
+# agent 不該改得動自己要呼叫的 server。
+MCP_BIN=/opt/mcp/node_modules/.bin/mcp-server-filesystem
+out="$(in_runtime "test -x $MCP_BIN && stat -c %u /opt/mcp")"
+case "$(printf '%s' "$out" | tr -d '\r\n ')" in
+    0)  ok "MCP filesystem server 在映像裡且為 root 所有（$MCP_BIN）" ;;
+    "") bad "找不到 MCP filesystem server" "runtime 映像是舊的？執行 make build" ;;
+    *)  bad "/opt/mcp 的擁有者 uid=$out（預期 0）" "agent 不該改得動自己要呼叫的 server" ;;
+esac
+
+out="$(in_runtime 'command -v node >/dev/null && echo HAVE_NODE')"
+if printf '%s' "$out" | grep -q HAVE_NODE; then
+    ok "runtime 有 node（stdio MCP server 要用）"
+else
+    bad "runtime 沒有 node" "上游映像本來內建 Node 22 —— 換版之後不見了？"
+fi
+
+# 真的講一次 MCP handshake。啟動 server、送 initialize、看它回不回 serverInfo。
+# 這證明的是「agent 呼叫得動這條路徑」，不只是檔案存在。
+init_req='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"hermes-verify","version":"1"}}}'
+inited='{"jsonrpc":"2.0","method":"notifications/initialized"}'
+out="$(in_runtime "printf '%s\n' '$init_req' | timeout 30 $MCP_BIN /workspace 2>&1 | head -5")"
+if printf '%s' "$out" | grep -q '"serverInfo"'; then
+    ok "MCP handshake 成功（server 回了 serverInfo）"
+else
+    bad "MCP handshake 失敗" "$(printf '%s' "$out" | head -2)"
+fi
+
+# 端到端：透過 MCP 讀上面那個寫進外部資料夾的探針檔，內容要對得上。
+probe_req='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_text_file","arguments":{"path":"/workspace/.verify-probe"}}}'
+out="$(in_runtime "printf '%s\n%s\n%s\n' '$init_req' '$inited' '$probe_req' \
+    | timeout 30 $MCP_BIN /workspace 2>&1")"
+if printf '%s' "$out" | grep -q "$token"; then
+    ok "MCP 讀得到外部資料夾的內容（read_text_file /workspace/.verify-probe）"
+else
+    bad "MCP 讀不到 /workspace/.verify-probe" "$(printf '%s' "$out" | tail -1 | head -c 160)"
+fi
+rm -f "${WORKSPACE}/.verify-probe"
+
+# 授權邊界：server 只接受命令列上列出的根目錄。這裡故意不把 / 列進去，
+# 然後要求它讀 /etc/passwd —— 必須被拒。
+read_req='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_text_file","arguments":{"path":"/etc/passwd"}}}'
+out="$(in_runtime "printf '%s\n%s\n%s\n' '$init_req' '$inited' '$read_req' \
+    | timeout 30 $MCP_BIN /workspace 2>&1")"
+if printf '%s' "$out" | grep -qi 'root:x:0:0'; then
+    bad "MCP server 讀得到 /etc/passwd" "允許根目錄的限制沒有生效"
+elif printf '%s' "$out" | grep -qiE 'outside allowed|not allowed|access denied|"isError":true'; then
+    ok "MCP server 拒絕允許清單外的路徑（/etc/passwd）"
+else
+    soft "分辨不出 MCP server 對 /etc/passwd 的回應" "$(printf '%s' "$out" | tail -1 | head -c 160)"
+fi
+
+# config.yaml 有沒有真的把 server 接起來。沒接的話 agent 那邊看不到 mcp__ 工具。
+out="$(in_runtime 'grep -A6 "^mcp_servers:" /opt/data/config.yaml 2>/dev/null')"
+if printf '%s' "$out" | grep -q 'mcp-server-filesystem'; then
+    ok "config.yaml 的 mcp_servers 已接上 filesystem server"
+else
+    bad "config.yaml 裡沒有 mcp_servers 設定" \
+        "跑 make seed-config（已有設定檔的話手動補上，範本見 examples/config.vllm.yaml）"
+fi
+
+# 預設 HERMES_WRITE_SAFE_ROOT 只有 /opt/data —— 外部資料夾走 MCP。
+# 有人刻意設回 /opt/data:/workspace 是允許的，所以這裡只提示，不算失敗。
 out="$(in_runtime 'echo $HERMES_WRITE_SAFE_ROOT')"
 if printf '%s' "$out" | grep -q '/workspace'; then
-    ok "HERMES_WRITE_SAFE_ROOT 含 /workspace（terminal 工具寫得進去）"
+    soft "HERMES_WRITE_SAFE_ROOT 含 /workspace" \
+        "原生 write_file/patch 也能直接寫外部資料夾（.env 明確設過就是預期行為）"
 else
-    bad "HERMES_WRITE_SAFE_ROOT 不含 /workspace" "目前值：$(printf '%s' "$out" | head -1)"
+    ok "HERMES_WRITE_SAFE_ROOT 不含 /workspace（外部資料夾只走 MCP）"
 fi
 
 # ---------------------------------------------------------------------------

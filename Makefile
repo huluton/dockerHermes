@@ -21,6 +21,11 @@ HERMES_UID := $(if $(HERMES_UID),$(HERMES_UID),10000)
 HERMES_GID := $(shell sed -n 's/^HERMES_GID=//p' .env 2>/dev/null | head -1)
 HERMES_GID := $(if $(HERMES_GID),$(HERMES_GID),10000)
 
+# 只給 make version / update-check / update 顯示用。實際建置時的版本仍然是
+# compose 從 .env 讀進去的（build.args），不經過這個變數。
+HERMES_VERSION := $(shell sed -n 's/^HERMES_VERSION=//p' .env 2>/dev/null | head -1)
+HERMES_VERSION := $(if $(HERMES_VERSION),$(HERMES_VERSION),v2026.7.20)
+
 COMPOSE := docker compose
 SANDBOX_IMAGE := hermes-sandbox:$(INSTANCE)
 PLATFORMS := linux/amd64,linux/arm64
@@ -41,6 +46,11 @@ help: ## 顯示這份說明
 	@echo
 	@echo "改用 Vertex AI（GCP）而不是地端 vLLM："
 	@echo "  make seed-config TEMPLATE=config.vertex.yaml   # 加 FORCE=1 覆蓋既有設定"
+	@echo
+	@echo "更新到最新版："
+	@echo "  make update-check                        # 看上游有哪些標籤"
+	@echo "  \$$EDITOR .env                             # 改 HERMES_VERSION（填 latest 也可以）"
+	@echo "  make update                              # 重建 + 滾動重啟，卷不動"
 
 # ---------------------------------------------------------------------------
 # 前置檢查
@@ -68,10 +78,6 @@ build: ## 建置三個映像（runtime / controller / sandbox）
 	@# 但映像還是得先存在。
 	docker build -t $(SANDBOX_IMAGE) ./sandbox
 
-.PHONY: pull-browser
-pull-browser: ## 拉 camofox 映像（上游有發佈，不用自建；約 3.5GB）
-	$(COMPOSE) --profile browser pull camofox
-
 .PHONY: buildx
 buildx: ## 驗證三個映像都能建出 amd64 + arm64
 	@# 多架構的結果沒辦法 --load 進本機 daemon，所以這裡只驗證「建得起來」。
@@ -93,20 +99,19 @@ up: check-env ## 啟動 stack
 	@echo "Dashboard：http://localhost:$$(sed -n 's/^DASHBOARD_PORT=//p' .env | head -1 || echo 9119)"
 	@echo "帳號：$$(sed -n 's/^HERMES_DASHBOARD_BASIC_AUTH_USERNAME=//p' .env | head -1 || echo admin)"
 
-.PHONY: up-browser
-up-browser: check-env ## 啟動 stack，含 camofox
-	$(COMPOSE) --profile browser up -d
-
 .PHONY: down
 down: ## 停止 stack（保留卷）
-	$(COMPOSE) --profile browser down
+	@# --remove-orphans：把舊版本留下、現在已經不在 compose 檔裡的容器一併收掉。
+	@# controller 動態建立的沙箱沒有 compose 的 label，不在 orphan 的判定範圍內，
+	@# 由下面的 reap 處理。
+	$(COMPOSE) down --remove-orphans
 	@$(MAKE) --no-print-directory reap
 
 .PHONY: destroy
 destroy: ## 停止 stack 並刪除所有卷（技能、狀態、資料全部消失）
 	@echo "這會刪除實例 '$(INSTANCE)' 的所有卷：資料、技能、版本庫、任務資料庫。"
 	@read -p "輸入 $(INSTANCE) 確認：" c && [ "$$c" = "$(INSTANCE)" ] || { echo "已取消"; exit 1; }
-	$(COMPOSE) --profile browser down -v
+	$(COMPOSE) down -v
 	@$(MAKE) --no-print-directory reap
 
 .PHONY: restart
@@ -128,6 +133,48 @@ logs: ## 追蹤所有服務的 log
 .PHONY: logs-controller
 logs-controller: ## 只追蹤 controller 的 log
 	$(COMPOSE) logs -f --tail=200 hermes-controller
+
+# ---------------------------------------------------------------------------
+# 更新
+# ---------------------------------------------------------------------------
+
+.PHONY: version
+version: ## 顯示 .env 要求的版本、映像實際建出來的版本、以及執行中的容器
+	@echo ".env 要求：       HERMES_VERSION=$(HERMES_VERSION)"
+	@printf '映像實際建置自： '
+	@docker image inspect hermes-runtime:$(INSTANCE) \
+		--format '{{index .Config.Labels "hermes.upstream.version"}}（MCP fs {{index .Config.Labels "hermes.mcp.filesystem.version"}}，建於 {{.Created}}）' \
+		2>/dev/null || echo "（映像還沒建，先 make build）"
+	@printf '執行中的容器：   '
+	@docker inspect hermes-$(INSTANCE)-runtime \
+		--format '{{.Config.Image}}  started={{.State.StartedAt}}' 2>/dev/null \
+		|| echo "（沒有在執行）"
+
+.PHONY: update-check
+update-check: ## 列出上游 hermes-agent 最近發佈的標籤
+	@echo "上游 nousresearch/hermes-agent 最近發佈的標籤（新到舊）："
+	@curl -fsSL 'https://hub.docker.com/v2/repositories/nousresearch/hermes-agent/tags/?page_size=100&ordering=last_updated' \
+		| tr ',' '\n' | sed -n 's/.*"name":"\([^"]*\)".*/  \1/p' | head -15 \
+		|| echo "  （查不到 —— 沒有網路，或 Docker Hub 的 API 有變）"
+	@echo
+	@echo "目前 .env 用的是 $(HERMES_VERSION)。改掉它再執行 make update。"
+
+.PHONY: update
+update: check-env ## 更新到 .env 指定的 HERMES_VERSION（含 latest），保留所有卷
+	@echo "更新到 HERMES_VERSION=$(HERMES_VERSION)（實例 $(INSTANCE)）"
+	@echo "資料、技能、版本庫、任務資料庫都在具名卷裡，這個流程不會動到它們。"
+	@echo
+	@# --pull：HERMES_VERSION 是 latest、或上游把同一個標籤重推過時，沒有
+	@# 這個旗標 docker 會沿用本機快取的舊 base image，看起來像「更新沒生效」。
+	$(COMPOSE) build --pull hermes-runtime hermes-controller
+	docker build --pull -t $(SANDBOX_IMAGE) ./sandbox
+	@# --remove-orphans：清掉舊版本留下、現在已經不在 compose 檔裡的容器。
+	$(COMPOSE) up -d --remove-orphans
+	@echo
+	@$(MAKE) --no-print-directory version
+	@echo
+	@echo "驗證：make verify"
+	@echo "要退回舊版：把 .env 的 HERMES_VERSION 改回去，再執行一次 make update。"
 
 # ---------------------------------------------------------------------------
 # 設定
