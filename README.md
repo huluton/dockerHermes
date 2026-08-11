@@ -9,22 +9,23 @@
         │                                                                   │
         │   hermes-runtime  ◄────────►  hermes-controller  ◄────►  sandbox  │
         │   :9119 Dashboard             :9200（不對外）           （短暫）  │
-        └────────┼──────────────────────────────┼───────────────────────────┘
-                 │                              │
-   ┌─────────────▼─────────────────┐  ┌─────────▼─────────────────────────────┐
-   │ mcp-net（internal: true）     │  │ docker-control-net（internal: true）  │
-   │                               │  │                                       │
-   │ hermes-mcp-fs :9300           │  │ docker-socket-proxy                   │
-   │   └─► 使用者的外部資料夾      │  │   └─► /var/run/docker.sock            │
-   └───────────────────────────────┘  └───────────────────────────────────────┘
+        └───────────────────────────────────┼───────────────────────────────┘
+                                            │
+                          ┌─────────────────▼─────────────────────┐
+                          │ docker-control-net（internal: true）  │
+                          │                                       │
+                          │ docker-socket-proxy                   │
+                          │   └─► /var/run/docker.sock            │
+                          └───────────────────────────────────────┘
 ```
 
-兩條側邊都是拓撲層級的保證，不是設定層級的約定：
+兩個拓撲層級的保證，不是設定層級的約定：
 
 - `hermes-controller` 是唯一連得到 Docker 控制層的服務，runtime 永遠碰不到。
-- 使用者的外部資料夾**只**掛在 `hermes-mcp-fs` 裡。runtime 沒有那個掛載點，
-  agent 就算拿到 terminal 也讀不到；sandbox 在 `hermes-net` 上，連
-  `hermes-mcp-fs` 這個名字都解析不到。
+- **沒有任何宿主機資料夾掛進來。** agent 碰得到的檔案只有具名卷裡的東西 ——
+  那不是政策設定擋下來的，是掛載點根本不存在，所以 terminal 工具、
+  `write_file`、進化出來的程式碼都一樣讀不到你的檔案。要開放某個資料夾時，
+  見「[3. 需要外部資料夾時](#3-需要外部資料夾時讓-hermes-自己裝一個-mcp-filesystem-server)」。
 
 ---
 
@@ -34,7 +35,7 @@
 cp .env.example .env
 nano .env                     # 至少要填 HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
 
-make build                    # runtime / mcp-fs / controller / sandbox 四個映像
+make build                    # runtime / controller / sandbox 三個映像
 make seed-config              # 把模型設定種進資料卷（首次啟動前）
 make edit-config              # 填 base_url 與模型名稱（接地端 vLLM 必做）
 make up
@@ -62,7 +63,7 @@ openssl rand -base64 24       # 產一組
 ```
 .
 ├── spec.md                    架構規格
-├── docker-compose.yml         四個服務、三個網路、四個卷
+├── docker-compose.yml         三個服務、兩個網路、五個卷
 ├── .env.example               所有可調參數
 ├── Makefile                   操作入口
 ├── runtime/
@@ -70,9 +71,6 @@ openssl rand -base64 24       # 產一組
 │   └── deps/                  build 時要多裝的套件（人工確認過才會出現在這裡）
 │       ├── apt.txt            Debian 套件，不釘版本
 │       └── pip.txt            Python 套件，釘版本，裝進 /opt/extra 而非 venv
-├── mcp-fs/                    remote MCP filesystem server（外部資料夾只掛在這裡）
-│   ├── Dockerfile             filesystem server + supergateway，版本都釘死
-│   └── entrypoint.sh          MCP_FS_ROOTS → 允許清單 → Streamable HTTP
 ├── controller/                進化生命週期管理（本專案自己寫的部分）
 │   ├── Dockerfile
 │   ├── entrypoint.sh          root 起 → chown 卷 → setpriv 降權
@@ -154,10 +152,7 @@ make build && make up
 
 唯一共用的是宿主機的 Docker daemon 與埠號空間 —— 記得把**所有**對外發佈的埠
 都改掉。目前只有 Dashboard 這一個（`DASHBOARD_PORT`）；controller 刻意不發佈
-埠，`hermes-mcp-fs` 的 MCP 端點也只在 `mcp-net` 上，兩者都不佔宿主機的埠。
-
-`WORKSPACE_DIR` 預設是相對路徑 `./workspace`，兩套各自解析到自己的目錄，
-不會撞在一起。要讓兩套共用同一個外部資料夾就把它指到同一個絕對路徑。
+埠，不佔宿主機的埠號。
 
 ### 2. 外接地端 vLLM
 
@@ -203,109 +198,92 @@ vLLM 沒開驗證的話 `api_key` 填 `"none"` —— 不能留空，OpenAI 相�
 不想自己跑模型的話，另一條路是走 Google Cloud 的 Vertex AI ——
 見下面的「用 Vertex AI（GCP）當推論後端」。
 
-### 3. 透過 MCP 操作外部資料夾
+### 3. 需要外部資料夾時：讓 hermes 自己裝一個 MCP filesystem server
 
-宿主機的 `WORKSPACE_DIR`（預設 `./workspace`，可以指到任何路徑）以 rw 掛在
-**`hermes-mcp-fs` 這個獨立容器**內的 `/workspace`。runtime 沒有這個掛載點。
+**預設沒有這個東西。** 這套 stack 不掛任何宿主機資料夾，agent 碰得到的檔案
+只有具名卷裡的東西。想讓 agent 讀寫你電腦上的某個目錄，是一件要「特地去做」
+的事，不是預設就開著等你關掉。
 
-Agent 唯一的路徑是 **MCP over HTTP**：`hermes-mcp-fs` 跑一個 remote MCP
-filesystem server，runtime 依 `config.yaml` 的 `mcp_servers` 連過去。
+作法是**讓 hermes 自己把它做出來，你在宿主機上 review 過再啟用** —— 跟
+[`make deps-accept`](#讓-agent-自由裝套件確認後再進-runtime) 同一個形狀的閘門。
 
-```yaml
-mcp_servers:
-  workspace-fs:
-    url: "http://hermes-mcp-fs:9300/mcp"
-    connect_timeout: 60
-    timeout: 120
-    tools:
-      prompts: false
-      resources: false
-```
+⚠️ 有一件事 hermes 做不到，而且是刻意的：**它不能自己把宿主機資料夾掛進來。**
+掛載是 Docker daemon 的動作，controller 那條 socket-proxy 通道只給建沙箱用；
+決定「哪個目錄被開放」的永遠是坐在鍵盤前面的人。hermes 能做的是把設定檔寫
+出來，最後那一步 `docker compose up -d` 得你自己按。
 
-`make seed-config` 種進去的範本已經含這一段，不用自己加。工具會以
-`mcp__workspace_fs__read_text_file`、`mcp__workspace_fs__write_file`、
-`mcp__workspace_fs__list_directory`… 的名稱出現在 agent 的工具清單裡。命名規則是
-`mcp__{server}__{tool}`，其中 `[A-Za-z0-9_]` 以外的字元（含連字號）會被換成
-底線 —— 所以 server 叫 `workspace-fs`，前綴是 `mcp__workspace_fs__`。啟動時
-`docker compose logs hermes-runtime | grep "registered"` 會列出實際註冊的
-14 個工具名稱。
+**流程**
 
-**這是容器邊界，不是工具層的君子協定。** 三道各自獨立的限制：
+1. 在 dashboard 裡直接要求它，例如：
 
-| 限制 | 由誰保證 | 繞得過嗎 |
+   > 幫我做一個 MCP filesystem server 容器，讓你能讀寫 `/srv/reports`。
+   > 產出 `mcp-fs/Dockerfile`、`mcp-fs/entrypoint.sh` 跟一份
+   > `docker-compose.override.yml`，寫到 `/opt/data/outbox/` 底下。不要試著
+   > 自己啟動它。
+
+   `/opt/data` 是它寫得到的資料卷（`HERMES_WRITE_SAFE_ROOT`）。
+
+2. 在宿主機上把檔案取出來看：
+
+   ```bash
+   docker compose exec hermes-runtime ls -R /opt/data/outbox
+   docker compose cp hermes-runtime:/opt/data/outbox/. ./mcp-fs-proposal/
+   ```
+
+3. **逐行看過**再放進 repo。三件事一定要自己確認，別讓 agent 代勞：
+
+   - `volumes:` 掛的是哪個宿主機路徑、有沒有 `:ro`。只要讀就加 `:ro`。
+   - 那個服務接的是哪個網路。它應該只跟 runtime 同網路，**不要**接
+     `docker-control-net`，也不要 `ports:` 發佈到宿主機。
+   - 有沒有偷偷多掛 `/`、`~`、`/var/run/docker.sock`、或 GCP 憑證目錄。
+
+4. 啟用：把檔案放到 repo 裡（進 git，之後才看得出誰改了什麼），
+   `docker compose up -d`，再把 `config.yaml` 的 `mcp_servers` 補上（範本在
+   `examples/config.vllm.yaml` 的 MCP 段落，已經是註解掉的完整範例）。
+   改完在對話裡下 `/reload-mcp` 就會重新連線，不用重啟容器（它會先問一次，
+   因為這會讓 prompt cache 失效；回 `/reload-mcp now` 確認）。
+
+**做出來之後該長什麼樣**
+
+一個獨立容器，不是把資料夾掛回 runtime。這兩者的差別是整節的重點：
+
+| | 掛回 runtime | 獨立的 MCP 容器 |
 |---|---|---|
-| runtime 裡沒有 `/workspace` 這個掛載點 | Docker（`docker-compose.yml` 不掛） | 不行 —— terminal、`write_file`、進化出來的程式碼都一樣拿不到檔案 |
-| `MCP_FS_ROOTS` 以外的路徑一律拒絕 | filesystem server 的允許清單 | 不行（symlink 也會被解析後檢查） |
-| `hermes-mcp-fs` 只在 `mcp-net` 上 | Docker 網路（`internal: true`） | sandbox 在 `hermes-net` 上，連 DNS 都解析不到 |
+| agent 的 terminal 工具 | 直接 `cat` 得到 | 沒有那個掛載點，讀不到 |
+| 進化出來的程式碼 | 直接讀得到 | 讀不到 |
+| 存取範圍 | 整個掛進去的目錄 | server 允許清單內的路徑，symlink 也會被解析後檢查 |
+| 收回權限 | 改 compose + 重啟 runtime | 停掉那一個容器就好 |
 
-`make verify` 第 7 節會逐條驗這些：runtime 裡確實沒有 `/workspace`、
-controller 所在的網路解析不到 `hermes-mcp-fs`、從 runtime 真的講一次完整的
-MCP 握手並讀到檔案、再要求 `/etc/passwd` 確認被拒。
+該給那個容器的 hardening（可以直接寫進要求裡讓 hermes 照做）：根檔案系統
+`read_only`、`cap_drop: ALL`、`no-new-privileges`、`pids_limit` 與 `mem_limit`、
+`/tmp` 走 tmpfs、以 `HERMES_UID:HERMES_GID` 執行、不 `ports:`、依賴的 npm 套件
+在**建置階段**裝好並釘死版本（不要用 `npx -y`，那是執行期下載，離線會失敗而且
+每次拉到的東西不保證一樣）。
 
-**兩層設定，各管各的。**「連到哪」在 `config.yaml`，「能碰哪些資料夾」在
-`.env` 加 bind mount：
+官方的 `@modelcontextprotocol/server-filesystem` 只講 stdio、沒有 HTTP 傳輸，
+所以中間還需要一個像 [supergateway](https://www.npmjs.com/package/supergateway)
+的東西把 stdio 包成 Streamable HTTP。用 stateful 模式（每個 MCP session 一個
+子行程，閒置後回收）；stateless 是每個 HTTP POST 重 spawn 一次並重跑
+initialize，對長對話又慢又浪費。
 
-```bash
-# .env —— 授權清單本身（容器內路徑，以 : 分隔）
-MCP_FS_ROOTS=/workspace
-```
+⚠️ **MCP 端點本身沒有身分驗證。** 官方 server 沒有這個東西，邊界只有網路
+拓撲：不發佈埠、只跟 runtime 同網路。要再收一層就在前面擺一個會驗
+`Authorization` 的反向代理，`config.yaml` 用 `headers:` 帶 token。
 
-改 `config.yaml` 不用重啟容器 —— 在 dashboard 的對話面板下 `/reload-mcp`，
-hermes 會重新連線並更新工具清單（它會先問一次，因為這會讓 prompt cache 失效；
-回 `/reload-mcp now` 確認）。不放心就 `docker compose restart hermes-runtime`，
-效果一樣。改資料夾清單則要重建 mcp-fs 容器（下面第二步）。
+⚠️ 那個容器掛的是宿主機目錄，**容器逃逸仍然等於拿到那些檔案**。這一層擋的是
+「agent 在正常運作下的存取範圍」，不是核心層級的隔離。
 
 ⚠️ hermes 自己也會寫 `config.yaml`（dashboard 改設定、版本遷移都會觸發），寫
 回去的是 YAML dump —— **範本裡的註解會被清掉**。設定值本身不會掉（它會保留使
 用者明確設過的每一個 key，`mcp_servers` 也在內），但別把註解當成長期文件，要
 留備忘請寫在 repo 裡。
 
-**開放第二個資料夾**：加一條 bind，再把容器內路徑補進 `MCP_FS_ROOTS`。
+`make verify` 第 7 節會盯著這條線：runtime 裡沒有非預期的宿主機 bind mount、
+controller 一個都沒有、`config.yaml` 若設了 MCP server 則那個主機名解析得到
+（設了卻連不到的話 hermes 會**靜默**跳過，agent 的工具清單直接變空）。啟用
+獨立容器之後，這幾條檢查應該仍然全綠 —— 綠不掉就表示資料夾被掛錯地方了。
 
-```yaml
-# docker-compose.override.yml
-services:
-  hermes-mcp-fs:
-    volumes:
-      - /srv/datasets:/datasets:ro      # 只給讀就加 :ro
-```
-
-```bash
-echo 'MCP_FS_ROOTS=/workspace:/datasets' >> .env
-docker compose up -d hermes-mcp-fs
-```
-
-兩邊都要改：只加 bind 不加 roots，MCP server 會拒絕存取；只加 roots 不加
-bind，容器啟動時會警告「目錄不存在」並跳過它（全部都不存在則拒絕啟動 ——
-一個沒有允許清單的 filesystem server 沒有意義）。
-
-**為什麼要一個 gateway。** 官方的
-`@modelcontextprotocol/server-filesystem` 只講 stdio，沒有 HTTP 傳輸。所以
-`mcp-fs` 映像裡多了一個 [supergateway](https://www.npmjs.com/package/supergateway)
-把它的 stdio 包成 Streamable HTTP。用 stateful 模式：每個 MCP session 對應一個
-子行程，閒置 `MCP_FS_SESSION_TIMEOUT_MS`（預設 30 分鐘）後回收 —— stateless
-模式是「每個 HTTP POST 重新 spawn 一次 server 並重跑 initialize」，對長對話
-又慢又浪費。session 被回收後 runtime 下一次呼叫會拿到錯誤，hermes 會自動重連。
-
-兩個套件都在建置階段裝好、版本由 `.env` 的 `MCP_FS_VERSION` 與
-`SUPERGATEWAY_VERSION` 釘死。刻意不用上游文件示範的 `command: "npx -y ..."`：
-那會在 agent 第一次呼叫工具的當下連 npm registry 下載套件 —— 執行期安裝，
-離線環境直接失敗，而且每次拉到的內容不保證一樣。
-
-**mcp-fs 容器自己也被收緊了。** 根檔案系統 `read_only`、`cap_drop: ALL`、
-`no-new-privileges`、`pids_limit` 與 `mem_limit`、`/tmp` 走 tmpfs，並以
-`HERMES_UID:HERMES_GID` 執行（agent 寫出去的檔案在宿主機上屬於你，不是 root）。
-
-⚠️ 誠實揭露：**MCP 端點本身沒有身分驗證。** 它的邊界是網路拓撲 —— 沒有發佈
-到宿主機，`mcp-net` 是 `internal`，而且只有 runtime 在上面（與 controller 的
-API 是同一個取捨）。任何能連到 `mcp-net` 的東西都能完整存取那些資料夾。要再
-收緊一層，就在 supergateway 前面擺一個會驗 `Authorization` 的反向代理，再用
-`config.yaml` 的 `headers:` 帶 token。
-
-另外，`hermes-mcp-fs` 掛的是宿主機目錄，容器逃逸仍然等於拿到那些檔案 ——
-這一層擋的是「agent 在正常運作下的存取範圍」，不是核心層級的隔離。
-
-想讓容器寫出來的檔案在宿主機上屬於你自己：
+**檔案的擁有者。** 想讓容器寫出來的檔案在宿主機上屬於你自己：
 
 ```bash
 echo "HERMES_UID=$(id -u)" >> .env
@@ -313,7 +291,7 @@ echo "HERMES_GID=$(id -g)" >> .env
 ```
 
 Runtime 與 Controller 必須用**同一組** UID/GID —— 否則 Controller 晉升出來的
-技能檔案，Runtime 讀不到。`hermes-mcp-fs` 也用同一組，它寫進外部資料夾的檔案
+技能檔案，Runtime 讀不到。新做的 MCP 容器也用同一組，它寫進外部資料夾的檔案
 在宿主機上才會屬於你。
 
 ### 4. Dashboard 可從遠端連接
@@ -333,13 +311,10 @@ tunnel / VPN。
 
 所有映像都確認過是多架構的（`docker manifest inspect` 實測 amd64 + arm64
 皆存在）：`nousresearch/hermes-agent`、`python:3.13-slim`、
-`tecnativa/docker-socket-proxy:v0.4.2`、`node:22-alpine`（`mcp-fs` 映像的
-基底）。MCP filesystem server 與 supergateway 都是純 JavaScript，沒有原生
-模組，兩個架構拿到的內容一樣 —— 所以 `mcp-fs/Dockerfile` 的建置階段固定用
-`--platform=$BUILDPLATFORM`，交叉建置時不必經過 QEMU 模擬。
+`tecnativa/docker-socket-proxy:v0.4.2`。
 
 ```bash
-make buildx     # 驗證自建的四個映像都能建出 linux/amd64 + linux/arm64
+make buildx     # 驗證自建的三個映像都能建出 linux/amd64 + linux/arm64
 ```
 
 **跨架構建置需要先裝 QEMU binfmt handler。** 在 amd64 主機上建 arm64 映像
@@ -398,10 +373,6 @@ make verify           # 確認架構在新版上依然成立
 docker run --rm -v hermes-default-data:/d -v "$PWD:/b" alpine \
     tar czf /b/hermes-data-backup.tar.gz -C /d .
 ```
-
-同時也可以更新 MCP filesystem server 與 gateway（`.env` 的 `MCP_FS_VERSION`
-與 `SUPERGATEWAY_VERSION`）—— 它們在 `mcp-fs` 映像的建置階段裝好，一樣走
-`make update`。
 
 ---
 
@@ -727,12 +698,10 @@ make verify                       # 第 9 節確認套件真的在跑著的容�
 | `/opt/data/skills/evolved`（線上技能） | **ro** | rw |
 | `/opt/data/skill-versions`（版本庫） | **ro** | rw |
 | `/opt/data`（自身狀態） | rw | 無 |
-| 外部資料夾 | **沒有掛載** —— 只在 `hermes-mcp-fs` 裡 | 無 |
+| 宿主機資料夾 | **沒有掛載**（GCP 憑證目錄以 ro 掛在 `/opt/gcp` 是唯一例外） | 無 |
 
-`make verify` 的第 3 節就是在驗這張表，第 7 節驗最後那一列。
-
-`hermes-mcp-fs` 自己則是整個根檔案系統 `read_only`，唯一可寫的地方就是掛進來
-的使用者資料夾。
+`make verify` 的第 3 節就是在驗這張表，第 7 節驗最後那一列 —— 它會直接列出
+兩個容器實際的 bind mount，`/opt/gcp:ro` 以外的一律報錯。
 
 ### 開機時會看到一行 warning，那是預期的
 
@@ -784,12 +753,10 @@ agent 本身讀得到 —— 被 prompt injection 誘導時就有外洩的可能
 - **Dashboard 沒有 TLS。** basic auth 的密碼以 base64 明文傳送。
 - **Controller API 沒有身分驗證。** 保護它的是「不發佈埠 + 只在應用網路上」。
   任何能在 `hermes-net` 上執行程式碼的東西都能呼叫它 —— 包括沙箱容器本身。
-- **MCP filesystem 端點也沒有身分驗證。** 同樣的取捨，但網路更窄：不發佈埠、
-  `mcp-net` 是 `internal`、上面只有 runtime 與 mcp-fs（沙箱不在）。能連上
-  `mcp-net` 就等於能完整存取那些資料夾。作法見「3. 透過 MCP 操作外部資料夾」。
-- **外部資料夾是宿主機目錄的 bind mount。** 把它從 runtime 拿掉擋的是「agent
-  正常運作下的存取範圍」；`hermes-mcp-fs` 本身被攻陷或容器逃逸，那些檔案還是
-  拿得到。
+- **自己加的 MCP filesystem server 端點不會有身分驗證。** 官方 server 沒有這
+  個東西，邊界只有網路拓撲。而且它掛的是宿主機目錄 —— 放進獨立容器擋的是
+  「agent 正常運作下的存取範圍」，那個容器被攻陷或逃逸，檔案還是拿得到。
+  預設沒有這個東西；要加的話見「3. 需要外部資料夾時」。
 - **沙箱可以連外網。** 進化任務通常要 `pip install`。要斷網的話，在
   `sandbox.py` 裡把 `NetworkMode` 改成 `none`，但那樣裝不了套件。
 
@@ -804,10 +771,9 @@ agent 本身讀得到 —— 被 prompt injection 誘導時就有外洩的可能
 的 PORTS 欄。正常是 `0.0.0.0:9119->9119/tcp`；如果只有 `9119/tcp`（沒有箭號），
 代表這個埠**根本沒發佈**，宿主機上不會有 listener。
 
-原因幾乎都是同一個：runtime 同時接 `hermes-net` 與 `mcp-net`，而 `mcp-net` 是
-`internal: true`。要是 `hermes-net` 那一條沒接上（`docker compose up` 中途被
-打斷、或那個網路是同名舊專案留下來的殘骸），容器就只剩一條沒有對外路由的網
-路，Docker 發佈不了埠 —— 但容器本身照跑、healthcheck 走 loopback 也照樣過。
+原因幾乎都是同一個：runtime 沒有接上 `hermes-net`（`docker compose up` 中途被
+打斷、或那個網路是同名舊專案留下來的殘骸）。沒有一條有對外路由的網路，Docker
+就發佈不了埠 —— 但容器本身照跑、healthcheck 走 loopback 也照樣過。
 
 ```bash
 docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' hermes-1-runtime
@@ -827,41 +793,37 @@ up -d` **不會**自己補上缺的網路連線 —— 它看到容器在跑就�
 **Agent 看到同一個技能的好幾個版本** — 版本庫被掛進了掃描樹裡。確認
 `SKILL_VERSIONS_DIR` 在 `/opt/data/skills` 之外。`config.py` 啟動時會擋這種設定。
 
-**Agent 的工具清單裡沒有 `mcp__workspace_fs__*`** — `config.yaml` 裡缺
-`mcp_servers` 區塊。既有的資料卷不會因為範本更新而自動跟著改：用
-`make edit-config` 手動補上（內容抄 `examples/config.vllm.yaml`），或
-`make seed-config FORCE=1` 重種一份（會先備份）。補完在對話裡下 `/reload-mcp`。
-`make verify` 第 7 節會檢查這件事。
+**Agent 的工具清單裡沒有 MCP 工具** — 預設就是這樣，這套 stack 不掛任何宿主機
+資料夾，也不設定任何 MCP server。要開放某個資料夾見「3. 需要外部資料夾時」。
 
-這是最常見的一種「MCP 壞掉」，而且症狀很容易誤導 —— 不是連線失敗、不是權限被
-拒，是那組工具**根本沒出現**。從舊資料卷升上來的人尤其會遇到：`seed-config`
-預設不覆蓋既有的 `config.yaml`，所以範本更新過幾輪，你的資料卷裡還是最初那份。
-直接確認：
+自己加過 MCP server 之後才變成空的，依序查這三件事（`make verify` 第 7 節會
+一次驗完前兩件）：
 
 ```bash
+# 1) config.yaml 到底有沒有那段設定。既有資料卷不會因為範本更新而自動跟著改，
+#    seed-config 預設也不覆蓋 —— 從舊卷升上來的人最常卡在這裡。
 docker compose exec hermes-runtime grep -c '^mcp_servers:' /opt/data/config.yaml
+
+# 2) 那個主機名解析得到嗎。容器沒起來的話 hermes 會「靜默」跳過，不報錯。
+docker compose exec hermes-runtime getent hosts <compose 服務名>
+
+# 3) 上游映像裡有沒有選用的 mcp Python 套件。少了它整個 MCP 探索會被靜默跳過
+#    （設定沒錯、server 也活著，就是沒有工具），log 只留一行 "MCP SDK not available"。
+docker compose exec hermes-runtime python3 -c 'import mcp.client.streamable_http'
 ```
 
-**Log 出現「MCP SDK not available」** — 上游映像裡少了選用的 `mcp` Python 套件，
-hermes 會**靜默**跳過整個 MCP 探索（設定沒錯、server 也活著，就是沒有工具）。
-`make verify` 第 7 節會直接驗 `import mcp.client.streamable_http`。這是上游映像
-的相依，換 `HERMES_VERSION` 之後值得重跑一次 verify。
+三種症狀都一樣：不是連線失敗、不是權限被拒，是那組工具**根本沒出現**。改完
+`config.yaml` 在對話裡下 `/reload-mcp` 就會重連。第 3 項是上游映像的相依，換
+`HERMES_VERSION` 之後值得重確認一次。
 
-**MCP 工具回「path outside allowed directories」** — 目標路徑不在 `.env` 的
-`MCP_FS_ROOTS` 清單裡。那是預期的拒絕，不是故障；要開放就給 `hermes-mcp-fs`
-加一條 bind，再把容器內路徑補進 `MCP_FS_ROOTS`。
+**MCP 工具回「path outside allowed directories」** — 目標路徑不在那個 server
+的允許清單裡。這是預期的拒絕，不是故障。要開放就給那個容器加一條 bind，再把
+容器內路徑補進它的允許清單 —— 兩邊都要改，只改一邊不會生效。
 
-**MCP 工具全部消失，log 出現連線錯誤** — `hermes-mcp-fs` 沒起來，或
-`config.yaml` 的 `url` 指錯（主機名要是 compose 的服務名 `hermes-mcp-fs`，
-埠要與 `.env` 的 `MCP_FS_PORT` 一致）。`docker compose logs hermes-mcp-fs`
-看它有沒有抱怨「允許清單裡的目錄不存在」。從舊版升上來的人特別注意：舊的
-`config.yaml` 寫的是 `command: /opt/mcp/...`，那個檔案已經不在 runtime 映像
-裡了 —— 改成 `url:`（範本見 `examples/config.vllm.yaml`）。
-
-**agent 說它看不到 `/workspace`** — 那是對的。runtime 容器裡沒有這個目錄，
-外部資料夾只能透過 `mcp__workspace_fs__*` 這組工具存取。如果 agent 一直想用
-terminal 去 `ls /workspace`，在 `config.yaml` 的 system prompt 或技能說明裡
-講清楚要用 MCP 工具。
+**agent 說它看不到某個宿主機目錄** — 那是對的，預設就沒有。runtime 容器裡沒有
+任何宿主機掛載點，agent 用 terminal 去 `ls` 一定找不到。開放過資料夾之後 agent
+還是一直想用 terminal，就在 `config.yaml` 的 system prompt 或技能說明裡講清楚
+那個目錄只能透過 `mcp__*` 工具存取。
 
 **`make evolve` 回 503** — 併發任務數滿了（`MAX_CONCURRENT_TASKS`），或
 controller 連不上 socket-proxy。`make status` 看細節。

@@ -1,19 +1,18 @@
 # Hermes 自我進化 Agent —— 完整 stack。
 #
-# 三層網路：
+# 兩層網路：
 #
 #   hermes-net（應用層）
 #     hermes-runtime  ◄──►  hermes-controller  ◄──►  hermes-sandbox（動態建立）
-#           │                       │
-#           │                       ▼
-#           │       docker-control-net（internal: true，對外完全隔離）
-#           │                docker-socket-proxy ──► /var/run/docker.sock
-#           ▼
-#   mcp-net（internal: true）
-#     hermes-mcp-fs ──► 使用者的外部資料夾（WORKSPACE_DIR）
+#                                   │
+#                                   ▼
+#                   docker-control-net（internal: true，對外完全隔離）
+#                            docker-socket-proxy ──► /var/run/docker.sock
 #
-# 外部資料夾只掛在 hermes-mcp-fs 裡。runtime 要碰使用者的檔案，只能透過
-# mcp-net 上的 MCP over HTTP；sandbox 在 hermes-net 上，連解析都解析不到它。
+# 這套 stack 完全沒有掛任何宿主機資料夾（除了 socket-proxy 的 docker.sock 與
+# runtime 唯讀的 GCP 憑證目錄）。agent 碰得到的檔案只有具名卷裡的東西。
+# 需要讓 agent 讀寫你電腦上的資料夾時，見 README 的
+# 「需要外部資料夾時：讓 hermes 自己裝一個 MCP filesystem server」。
 #
 # 快速開始：
 #     cp .env.example .env
@@ -43,14 +42,6 @@ networks:
   # /var/run/docker.sock，那是 bind mount，不受這個設定影響。
   docker-control-net:
     name: hermes-${INSTANCE:-default}-control
-    internal: true
-
-  # 檔案存取層。只有 runtime 與 hermes-mcp-fs 在這裡 —— 進化任務跑的 sandbox
-  # 在 hermes-net 上，連 hermes-mcp-fs 這個名字都解析不到。
-  #
-  # 一樣是 internal：mcp-fs 掛著使用者的資料夾，它不需要、也不該有對外路由。
-  mcp-net:
-    name: hermes-${INSTANCE:-default}-mcp
     internal: true
 
 # ---------------------------------------------------------------------------
@@ -115,16 +106,6 @@ services:
 
     networks:
       - hermes-net
-      # 唯一通往使用者外部資料夾的路徑。runtime 沒有那個 bind mount，
-      # 只有這條網路上的 MCP over HTTP。
-      - mcp-net
-
-    depends_on:
-      # mcp-fs 沒起來的話，agent 的 mcp__workspace_fs__* 工具會整組消失
-      # （hermes 連不上就跳過那個 server）。等它 healthy 再啟動 runtime，
-      # 省掉一輪「工具怎麼不見了 → /reload-mcp」。
-      hermes-mcp-fs:
-        condition: service_healthy
 
     ports:
       # Dashboard 要能從遠端連接，所以預設綁 0.0.0.0。
@@ -147,9 +128,12 @@ services:
       # 版本庫，唯讀。evolved/ 裡的 symlink 指向這裡，沒掛就全部斷掉。
       - hermes-versions:/opt/data/skill-versions:ro
 
-      # 刻意「沒有」掛外部資料夾。WORKSPACE_DIR 只掛在 hermes-mcp-fs 裡 ——
-      # runtime 上的 terminal、原生 write_file、以及任何被進化出來的程式碼，
-      # 在 OS 層都碰不到使用者的檔案。唯一的路徑是 mcp-net 上的 MCP over HTTP。
+      # 刻意「沒有」掛任何宿主機資料夾。runtime 上的 terminal、原生
+      # write_file、以及任何被進化出來的程式碼，在 OS 層都碰不到你電腦上的
+      # 檔案 —— 那不是政策設定擋下來的，是掛載點根本不存在。
+      #
+      # 需要開放某個資料夾時見 README 的「需要外部資料夾時」：由 hermes 產出
+      # 一個獨立的 MCP filesystem server 容器，你在宿主機上 review 後才啟用。
 
       # GCP service account 憑證，唯讀。目錄裡沒放 JSON 的話整段是 no-op ——
       # vertex_adapter 的 _resolve_credentials_path() 會做 os.path.exists()
@@ -172,11 +156,6 @@ services:
       # agent 原生 write_file / patch 工具的可寫範圍。這個容器裡本來就只有
       # 資料卷 —— 外部資料夾不在這裡，把它加進來也變不出檔案。
       HERMES_WRITE_SAFE_ROOT: ${HERMES_WRITE_SAFE_ROOT:-/opt/data}
-
-      # remote MCP filesystem server 的位址。config.yaml 的 mcp_servers 可以
-      # 直接寫死這個 URL，也可以寫成 "${HERMES_MCP_FS_URL}" —— hermes 會做
-      # ${VAR} 代換，那樣改 MCP_FS_PORT 就不必同時改 config.yaml。
-      HERMES_MCP_FS_URL: http://hermes-mcp-fs:${MCP_FS_PORT:-9300}${MCP_FS_PATH:-/mcp}
 
       # Dashboard 的 basic auth。上游 2026 年 6 月的強化之後，只要綁定位址
       # 不是 loopback，dashboard 就強制要求一個 auth provider，否則 fail
@@ -217,93 +196,6 @@ services:
 
     # 進化任務可能吃掉不少記憶體，但 runtime 本身不該被沙箱拖垮。
     stop_grace_period: 30s
-
-  # =========================================================================
-  # hermes-mcp-fs —— 獨立容器裡的 remote MCP filesystem server
-  # =========================================================================
-  # 使用者的外部資料夾只掛在這個容器裡。它把
-  # @modelcontextprotocol/server-filesystem 的 stdio 包成 Streamable HTTP，
-  # runtime 以 MCP client 的身分連過來。
-  #
-  # 這樣「哪些檔案碰得到」就不再是 agent 那邊的工具層設定，而是容器邊界：
-  # runtime 裡沒有這個 bind mount，就算 agent 拿到 terminal 也讀不到。
-  hermes-mcp-fs:
-    build:
-      context: ./mcp-fs
-      args:
-        MCP_FS_VERSION: ${MCP_FS_VERSION:-2026.7.10}
-        SUPERGATEWAY_VERSION: ${SUPERGATEWAY_VERSION:-3.4.3}
-    image: hermes-mcp-fs:${INSTANCE:-default}
-    container_name: hermes-${INSTANCE:-default}-mcp-fs
-    restart: unless-stopped
-
-    # 只在 mcp-net 上，而 mcp-net 是 internal —— 這個容器既沒有對外路由，
-    # 也不在 sandbox 所在的 hermes-net 上。
-    networks:
-      - mcp-net
-
-    # 刻意不發佈任何埠。這個 MCP 端點沒有身分驗證，網路拓撲就是它的邊界
-    # （與 controller 同一個取捨）。
-    #
-    # ⚠️ 誠實揭露：任何連得到 mcp-net 的東西都能完整存取這些資料夾。要再收
-    #    緊一層就在 supergateway 前面擺一個會驗 Authorization 的反向代理，
-    #    再用 config.yaml 的 headers: 帶 token。
-
-    # 與 runtime 同一組 UID/GID —— agent 寫出去的檔案在宿主機上才屬於你，
-    # 而不是 root。
-    user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
-
-    volumes:
-      # 使用者的外部資料夾。WORKSPACE_DIR 可以指到宿主機上任何路徑
-      # （例如 /home/me/projects）。
-      #
-      # 要開放第二個資料夾：在這裡（或 docker-compose.override.yml）加一條
-      # bind，再把容器內路徑補進下面的 MCP_FS_ROOTS。兩邊都要改 —— 只加
-      # bind 不加 roots 的話 MCP server 會拒絕存取，只加 roots 不加 bind 則
-      # 會在啟動時被警告成「目錄不存在」。
-      - ${WORKSPACE_DIR:-./workspace}:/workspace
-
-    environment:
-      # 允許存取的根目錄，以 : 分隔。這就是授權清單本身。
-      MCP_FS_ROOTS: ${MCP_FS_ROOTS:-/workspace}
-
-      MCP_FS_PORT: ${MCP_FS_PORT:-9300}
-      MCP_FS_PATH: ${MCP_FS_PATH:-/mcp}
-
-      # 閒置多久回收一個 MCP session 的子行程（毫秒）。0 = 只有客戶端明確
-      # 終止才回收，那樣被遺棄的 session 會一直佔著一個 node 行程。
-      MCP_FS_SESSION_TIMEOUT_MS: ${MCP_FS_SESSION_TIMEOUT_MS:-1800000}
-
-      # info 會逐筆記下 session 的建立與回收，方便追「agent 到底碰了什麼」。
-      # 嫌吵就設成 none。
-      MCP_FS_LOG_LEVEL: ${MCP_FS_LOG_LEVEL:-info}
-
-    # 根檔案系統唯讀。這個容器唯一該寫的地方是掛進來的資料夾，
-    # 其他任何寫入都是它不該做的事。
-    read_only: true
-    tmpfs:
-      - /tmp:size=16m,mode=1777
-
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-
-    # stateful 模式下每個 MCP session 一個 node 子行程。這兩個上限是為了讓
-    # 「session 沒被回收乾淨」變成侷限在這個容器裡的問題。
-    pids_limit: 256
-    mem_limit: 512m
-
-    healthcheck:
-      # supergateway 的 --healthEndpoint 就只回一個字串 ok。
-      # busybox wget 在連不上時回非 0，所以 grep 到 ok 才算通過。
-      test: ["CMD-SHELL", "wget -q -O - \"http://127.0.0.1:$${MCP_FS_PORT}$${MCP_FS_HEALTH_PATH}\" | grep -q ok"]
-      interval: 30s
-      timeout: 5s
-      start_period: 10s
-      retries: 3
-
-    stop_grace_period: 10s
 
   # =========================================================================
   # hermes-controller —— 進化生命週期管理

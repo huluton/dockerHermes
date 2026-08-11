@@ -11,9 +11,9 @@
 # 容器內執行 pip install」這條原則。所有需要安裝依賴的進化工作都發生在
 # hermes-sandbox 這個短暫容器裡。
 #
-# 這個容器裡「沒有」使用者的外部資料夾。存取外部資料夾的唯一路徑是打到
-# hermes-mcp-fs 那個獨立容器的 MCP over HTTP —— 見 mcp-fs/Dockerfile 與
-# README 的「3. 透過 MCP 操作外部資料夾」。
+# 這個容器裡「沒有」任何宿主機資料夾（唯一例外是唯讀的 GCP 憑證目錄）。
+# 需要開放某個目錄時見 README 的「3. 需要外部資料夾時」—— 那條路走的是獨立
+# 容器 + MCP over HTTP，資料夾依然不會出現在這裡。
 #
 # 版本預設釘住而非用 :latest：自我進化的 agent 已經有夠多變動來源了，底層
 # runtime 不該是其中之一。要更新到最新版：改 .env 的 HERMES_VERSION（填
@@ -36,9 +36,8 @@ LABEL org.opencontainers.image.base.name="nousresearch/hermes-agent:${HERMES_VER
 # 維持上游預設 HERMES_WRITE_SAFE_ROOT=/opt/data —— agent 原生的 write_file /
 # patch 工具碰不到資料卷以外的路徑。
 #
-# 外部資料夾的存取走 hermes-mcp-fs（獨立容器裡的 remote MCP server）。這裡
-# 沒有 /workspace 可以寫，不是因為政策設定，而是因為那個掛載點根本不在這個
-# 容器裡 —— 把 /workspace 加進這個變數也變不出檔案來。
+# 這個容器裡沒有任何宿主機目錄可以寫，不是因為政策設定，而是因為掛載點根本
+# 不存在 —— 把別的路徑加進這個變數也變不出檔案來。
 ENV HERMES_WRITE_SAFE_ROOT=/opt/data
 
 # ---------------------------------------------------------------------------
@@ -71,7 +70,8 @@ ENV HERMES_DASHBOARD=1 \
 # os.walk(followlinks=True) 走遍整個 skills 目錄，版本庫若在掃描範圍內，
 # 保留的每一個歷史版本都會被當成一個獨立的線上技能。
 #
-# 這裡刻意「沒有」/workspace —— 外部資料夾只掛在 hermes-mcp-fs 容器裡。
+# 這裡刻意沒有任何宿主機資料夾的掛載點。需要開放目錄時走獨立的 MCP 容器，
+# 見 README 的「3. 需要外部資料夾時」。
 #
 # 屬主設成 10000:10000（映像內建的 hermes 使用者）。若透過 HERMES_UID /
 # HERMES_GID 改用其他 UID，上游的 stage2-hook 開機時會重新 chown。

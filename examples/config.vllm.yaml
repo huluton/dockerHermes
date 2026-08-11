@@ -54,45 +54,36 @@ model:
   temperature: 0.7
 
 # ---------------------------------------------------------------------------
-# MCP —— 操作外部資料夾
+# MCP
 # ---------------------------------------------------------------------------
-# 使用者的外部資料夾「不在」這個容器裡。它掛在 hermes-mcp-fs 這個獨立容器
-# 中，那裡跑著一個 remote MCP filesystem server（Streamable HTTP）。這裡設定
-# 的是「連到哪」，工具以 mcp__workspace_fs__<tool> 的名稱出現
-# （read_text_file、write_file、list_directory、move_file、search_files…）。
+# 預設不設定任何 MCP server。這套 stack 沒有掛宿主機資料夾，agent 碰得到的
+# 只有具名卷 —— 這是刻意的預設值，不是還沒設定。
 #
-# 允許存取哪些目錄「不是」在這裡決定的 —— 那是 mcp-fs 容器的 MCP_FS_ROOTS
-# 加上它的 bind mount 決定的（見 .env 與 docker-compose.yml）。這份設定拿不到
-# 清單以外的任何檔案，就算改壞也一樣。
+# 要讓 agent 讀寫你電腦上的某個資料夾，見 README 的「需要外部資料夾時」：
+# 由 hermes 產出一個獨立的 MCP filesystem server 容器，你 review 過再啟用，
+# 屆時這裡會多一段長這樣的設定（url 的主機名是那個容器的服務名）：
 #
-# 改完不必重啟容器 —— 在對話裡下 /reload-mcp 會重新連線並更新工具清單。
-# 但如果動到的是資料夾清單（MCP_FS_ROOTS / bind mount），那要
-# `docker compose up -d hermes-mcp-fs` 讓那個容器重建。
-mcp_servers:
-  workspace-fs:
-    # 主機名是 compose 的服務名，埠是 .env 的 MCP_FS_PORT。也可以寫成
-    # "${HERMES_MCP_FS_URL}"（compose 會把這個變數注入 runtime，hermes 在
-    # 連線時展開）—— 那樣改埠號就不必同時改這裡。這裡用字面值，方便直接
-    # grep 到，也方便看出它是「跨容器」而不是本機子行程。
-    url: "http://hermes-mcp-fs:9300/mcp"
-
-    # 連線與單次工具呼叫的逾時（秒）。
-    connect_timeout: 60
-    timeout: 120
-
-    tools:
-      # 這個 server 不提供 prompt / resource，關掉可以少兩輪探測。
-      prompts: false
-      resources: false
-
-      # 只想要唯讀存取的話，把 include 打開（未列出的工具不會註冊）：
-      # include:
-      #   - read_text_file
-      #   - read_multiple_files
-      #   - list_directory
-      #   - directory_tree
-      #   - search_files
-      #   - get_file_info
+# mcp_servers:
+#   workspace-fs:
+#     url: "http://hermes-mcp-fs:9300/mcp"
+#     connect_timeout: 60
+#     timeout: 120
+#     tools:
+#       prompts: false
+#       resources: false
+#       # 只要唯讀的話，把 include 打開 —— 未列出的工具不會註冊。
+#       # 這是「agent 只能讀不能寫」最省事的做法。
+#       # include:
+#       #   - read_text_file
+#       #   - read_multiple_files
+#       #   - list_directory
+#       #   - directory_tree
+#       #   - search_files
+#       #   - get_file_info
+#
+# 工具會以 mcp__workspace_fs__<tool> 的名稱出現（hermes 把非英數字元換成
+# 底線）。改完這一段不必重啟容器，在對話裡下 /reload-mcp 就會重新連線；
+# 但改到「哪些目錄被開放」的話，要重建那個 MCP 容器才算數。
 
 # ---------------------------------------------------------------------------
 # 進化出來的技能

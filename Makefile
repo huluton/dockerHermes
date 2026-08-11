@@ -72,21 +72,20 @@ check-env:
 # ---------------------------------------------------------------------------
 
 .PHONY: build
-build: ## 建置四個映像（runtime / mcp-fs / controller / sandbox）
-	$(COMPOSE) build hermes-runtime hermes-mcp-fs hermes-controller
+build: ## 建置三個映像（runtime / controller / sandbox）
+	$(COMPOSE) build hermes-runtime hermes-controller
 	@# sandbox 不是 compose 服務 —— 它是 controller 動態建立的短暫容器，
 	@# 但映像還是得先存在。
 	docker build -t $(SANDBOX_IMAGE) ./sandbox
 
 .PHONY: buildx
-buildx: ## 驗證四個映像都能建出 amd64 + arm64
+buildx: ## 驗證三個映像都能建出 amd64 + arm64
 	@# 多架構的結果沒辦法 --load 進本機 daemon，所以這裡只驗證「建得起來」。
 	@# 要推到 registry 的話，把 --platform 那行後面加 --push 與 -t <registry>/...
 	docker buildx build --platform $(PLATFORMS) ./runtime
-	docker buildx build --platform $(PLATFORMS) ./mcp-fs
 	docker buildx build --platform $(PLATFORMS) ./controller
 	docker buildx build --platform $(PLATFORMS) ./sandbox
-	@echo "✓ 四個映像在 $(PLATFORMS) 都建置成功"
+	@echo "✓ 三個映像在 $(PLATFORMS) 都建置成功"
 
 # ---------------------------------------------------------------------------
 # 生命週期
@@ -94,7 +93,6 @@ buildx: ## 驗證四個映像都能建出 amd64 + arm64
 
 .PHONY: up
 up: check-env ## 啟動 stack
-	@mkdir -p "$$(sed -n 's/^WORKSPACE_DIR=//p' .env | head -1 || echo ./workspace)" 2>/dev/null || true
 	$(COMPOSE) up -d
 	@echo
 	@echo "Dashboard：http://localhost:$$(sed -n 's/^DASHBOARD_PORT=//p' .env | head -1 || echo 9119)"
@@ -146,10 +144,6 @@ version: ## 顯示 .env 要求的版本、映像實際建出來的版本、以�
 	@docker image inspect hermes-runtime:$(INSTANCE) \
 		--format '{{index .Config.Labels "hermes.upstream.version"}}（建於 {{.Created}}）' \
 		2>/dev/null || echo "（映像還沒建，先 make build）"
-	@printf 'mcp-fs 映像：     '
-	@docker image inspect hermes-mcp-fs:$(INSTANCE) \
-		--format 'filesystem {{index .Config.Labels "hermes.mcp.filesystem.version"}} + supergateway {{index .Config.Labels "hermes.mcp.supergateway.version"}}' \
-		2>/dev/null || echo "（映像還沒建，先 make build）"
 	@printf '執行中的容器：   '
 	@docker inspect hermes-$(INSTANCE)-runtime \
 		--format '{{.Config.Image}}  started={{.State.StartedAt}}' 2>/dev/null \
@@ -171,7 +165,7 @@ update: check-env ## 更新到 .env 指定的 HERMES_VERSION（含 latest），�
 	@echo
 	@# --pull：HERMES_VERSION 是 latest、或上游把同一個標籤重推過時，沒有
 	@# 這個旗標 docker 會沿用本機快取的舊 base image，看起來像「更新沒生效」。
-	$(COMPOSE) build --pull hermes-runtime hermes-mcp-fs hermes-controller
+	$(COMPOSE) build --pull hermes-runtime hermes-controller
 	docker build --pull -t $(SANDBOX_IMAGE) ./sandbox
 	@# --remove-orphans：清掉舊版本留下、現在已經不在 compose 檔裡的容器。
 	$(COMPOSE) up -d --remove-orphans
