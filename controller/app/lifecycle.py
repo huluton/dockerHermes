@@ -28,6 +28,7 @@ from typing import Any, Iterator
 
 import docker
 
+from . import deps as deps_mod
 from . import promote as promote_mod
 from . import sandbox as sandbox_mod
 from . import scanner as scanner_mod
@@ -228,10 +229,16 @@ class EvolutionEngine:
                 self._active.add(container_id)
 
         outcome: sandbox_mod.SandboxOutcome | None = None
+        privileged = bool(spec.get("privileged_install"))
+        expect_artifacts = spec.get("expect_artifacts", True)
         try:
             # --- 階段 1：沙箱執行 ---------------------------------------
             outcome = sandbox_mod.run_task(
-                self.client, task_id, spec, on_container_created=track
+                self.client,
+                task_id,
+                spec,
+                on_container_created=track,
+                privileged=privileged,
             )
             self.store.update(
                 task_id,
@@ -257,7 +264,37 @@ class EvolutionEngine:
                 )
                 return
 
+            # --- 階段 1.5：記下沙箱裝了什麼 -------------------------------
+            # 條件刻意訂在「沙箱步驟全部成功」，而不是「整個任務成功」：一個
+            # 只想試裝套件的探測任務不會有技能產物，走不到晉升階段，但它裝了
+            # 什麼、驗到什麼版本，正是這裡最該留下來的東西。
+            #
+            # 這一步失敗絕不能影響任務結果 —— 依賴清單是附帶產出，技能晉升
+            # 才是主線。
+            try:
+                deps_mod.record(
+                    self.settings.deps_dir,
+                    task_id=task_id,
+                    skill=skill,
+                    installed=(outcome.result or {}).get("installed"),
+                    privileged=privileged,
+                    sandbox_status=outcome.status,
+                    instance=self.settings.instance,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("任務 %s 的依賴清單記錄失敗：%r", task_id, exc)
+
             if not outcome.artifacts:
+                if not expect_artifacts:
+                    # 相依性探測任務：沒有技能要晉升，到這裡就是成功。
+                    self.store.update(
+                        task_id,
+                        status="succeeded",
+                        phase="deps-only",
+                        finished_at=_now(),
+                    )
+                    log.info("探測任務 %s 完成（沒有技能產物，符合預期）", task_id)
+                    return
                 self._fail(
                     task_id, "sandbox", "沙箱執行成功，但 /work/out 底下沒有任何產物"
                 )

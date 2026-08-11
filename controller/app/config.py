@@ -86,6 +86,17 @@ class Settings:
     max_concurrent_tasks: int = field(
         default_factory=lambda: _env_int("MAX_CONCURRENT_TASKS", 2)
     )
+    # 是否允許任務要求特權安裝模式（以 root + 六個 capability 起沙箱，讓
+    # apt-get install 能用）。預設關閉。
+    #
+    # 為什麼要有這個營運層開關，而不是只看 API 上的 privileged_install：
+    # /evolve 沒有身分驗證（邊界是網路拓撲），能連到 hermes-net 的任何東西
+    # 都能送出任務。「這套 stack 到底准不准特權沙箱」是機器擁有者的決定，
+    # 該寫在 .env 裡，不該由每一次的請求自己說了算。
+    sandbox_allow_privileged: bool = field(
+        default_factory=lambda: _env("SANDBOX_ALLOW_PRIVILEGED_INSTALL", "0").lower()
+        in {"1", "true", "yes"}
+    )
 
     # --- 檔案系統 -------------------------------------------------------
     #
@@ -107,6 +118,12 @@ class Settings:
         default_factory=lambda: Path(_env("SKILL_VERSIONS_DIR", "/opt/data/skill-versions"))
     )
     state_dir: Path = field(default_factory=lambda: Path(_env("STATE_DIR", "/state")))
+    # 待審依賴清單。沙箱在裡面裝了什麼會被記到這裡的 pending/ 底下，等人用
+    # `make deps-accept` 併進 runtime/deps/*.txt。
+    #
+    # 這個卷刻意「沒有」掛進 runtime —— 它不是 runtime 讀的東西，而是給宿主機
+    # 上的人看的。runtime 只吃 build 時烘進映像的 /opt/deps。
+    deps_dir: Path = field(default_factory=lambda: Path(_env("DEPS_DIR", "/deps")))
     # 每個技能保留幾個歷史版本以供回滾。
     keep_versions: int = field(default_factory=lambda: _env_int("KEEP_VERSIONS", 5))
 

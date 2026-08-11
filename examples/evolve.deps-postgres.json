@@ -1,0 +1,60 @@
+{
+  "_comment": [
+    "依賴探測任務 —— 「先在沙箱裡裝裝看，確認可行再進 runtime」的第一步。",
+    "",
+    "    make evolve REQ=examples/evolve.deps-postgres.json",
+    "    make task ID=<回傳的 task_id>     # 等到 status=succeeded",
+    "    make deps-list                    # 沙箱裝了什麼，全在這裡",
+    "    make deps-show TASK=<task_id>     # 看完整清單（含相依套件）",
+    "    make deps-accept TASK=<task_id>   # 併進 runtime/deps/apt.txt",
+    "    git diff runtime/deps/ && git commit -am 'deps: postgresql'",
+    "    make build && make up && make verify",
+    "",
+    "兩個跟一般進化任務不一樣的欄位：",
+    "",
+    "  privileged_install: true",
+    "    沙箱改成 root + 六個檔案權限相關的 capability 起。沒有這個，apt-get",
+    "    在 cap_drop: ALL 底下會以 'Unable to locate package' 收場 —— 那個訊息",
+    "    看起來像套件不存在，實際上是 dpkg 動不了 /var/lib/dpkg。",
+    "    需要營運端先在 .env 設 SANDBOX_ALLOW_PRIVILEGED_INSTALL=1，否則這個",
+    "    請求會被回 403。",
+    "",
+    "  expect_artifacts: false",
+    "    這個任務不產出技能，只是去試裝套件。少了這一項，晉升階段會以",
+    "    「沒有產物」判定失敗，而失敗的任務不會留下待審清單。",
+    "",
+    "第一步一定要 apt-get update：沙箱映像在 build 的最後清掉了",
+    "/var/lib/apt/lists，容器起來時是空的。",
+    "",
+    "裝在沙箱裡的東西跟著容器一起消失 —— 這個任務唯一的產出是那份清單。",
+    "真正把套件裝進 runtime 的是之後的 make build，而中間隔著一次人工審查",
+    "與一次 git commit。細節見 README 的「讓 agent 自由裝套件，確認後再進 runtime」。"
+  ],
+
+  "skill": "deps-postgres",
+  "timeout_sec": 900,
+  "privileged_install": true,
+  "expect_artifacts": false,
+
+  "env": {
+    "DEBIAN_FRONTEND": "noninteractive"
+  },
+
+  "steps": [
+    {
+      "name": "apt-update",
+      "timeout_sec": 180,
+      "run": "apt-get update"
+    },
+    {
+      "name": "install-postgresql",
+      "timeout_sec": 600,
+      "run": "apt-get install -y --no-install-recommends postgresql-17 postgresql-client-17"
+    },
+    {
+      "name": "smoke-test",
+      "timeout_sec": 120,
+      "run": "/usr/lib/postgresql/17/bin/postgres --version && /usr/lib/postgresql/17/bin/initdb --version"
+    }
+  ]
+}

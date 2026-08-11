@@ -20,6 +20,10 @@
 輸出  ``/work/result.json``（永遠會被寫出來，連 crash 的情況也是），
 候選技能檔案則放在 ``/work/out/``。
 
+result.json 裡的 ``installed`` 欄位記錄「這次任務在沙箱裡多裝了什麼」。沙箱
+跑完就被銷毀，裝出來的檔案跟著消失 —— 能搬到 runtime 的只有這份清單，而且
+它不會自動生效，見 controller/app/deps.py 與 README 的「讓 agent 自由裝套件」。
+
 設計上的重點：**這個腳本絕不能不留結果就死掉。** 容器一結束就會被銷毀，
 如果 result.json 沒寫出來，controller 就只剩一個裸退出碼可看，任何診斷資訊
 都沒了。所以主要邏輯整個包在 try/finally 裡，finally 一定寫檔。
@@ -172,6 +176,106 @@ def _collect_artifacts() -> list[str]:
     )
 
 
+# --- 套件快照 --------------------------------------------------------------
+#
+# 這裡的每一個函式都遵守同一條規則：**失敗就回 None，絕不拋例外。** 快照是
+# 附加資訊，不是任務的目的；一個 dpkg-query 打嗝不該讓一次跑了十分鐘的進化
+# 任務變成失敗。
+
+
+def _query(cmd: list[str], timeout: float = 60.0) -> str | None:
+    try:
+        proc = subprocess.run(  # noqa: S603 — 固定的命令，不含任務輸入
+            cmd, capture_output=True, timeout=timeout, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.decode("utf-8", errors="replace")
+
+
+def _apt_snapshot() -> dict[str, str] | None:
+    """已安裝的 Debian 套件 -> 版本。
+
+    用 dpkg-query 而不是 `apt list --installed`：前者的輸出格式由 -f 完全指定，
+    不會因為 apt 的版本或語系而變動，也不會夾雜「WARNING: apt does not have a
+    stable CLI interface」那行。
+    """
+    raw = _query(["dpkg-query", "-W", "-f", "${Package}\t${Version}\n"])
+    if raw is None:
+        return None
+    out: dict[str, str] = {}
+    for line in raw.splitlines():
+        name, _, version = line.partition("\t")
+        if name and version:
+            out[name] = version
+    return out
+
+
+def _pip_snapshot() -> dict[str, str] | None:
+    """venv 裡已安裝的 Python 套件 -> 版本。"""
+    raw = _query(
+        [sys.executable, "-m", "pip", "list", "--format=json",
+         "--disable-pip-version-check"]
+    )
+    if raw is None:
+        return None
+    try:
+        entries = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(entries, list):
+        return None
+    return {
+        str(e["name"]): str(e["version"])
+        for e in entries
+        if isinstance(e, dict) and e.get("name") and e.get("version")
+    }
+
+
+def _snapshot() -> dict[str, dict[str, str] | None]:
+    return {"apt": _apt_snapshot(), "pip": _pip_snapshot()}
+
+
+def _diff_one(
+    before: dict[str, str] | None, after: dict[str, str] | None
+) -> list[dict[str, str]] | None:
+    """算出「多出來或版本變了」的套件。回傳 None 代表這一類沒抓到快照。"""
+    if before is None or after is None:
+        return None
+    changed: list[dict[str, str]] = []
+    for name, version in sorted(after.items()):
+        previous = before.get(name)
+        if previous == version:
+            continue
+        entry = {"name": name, "version": version}
+        if previous is not None:
+            entry["previous"] = previous
+        changed.append(entry)
+    return changed
+
+
+def _diff_snapshots(
+    before: dict[str, dict[str, str] | None],
+    after: dict[str, dict[str, str] | None],
+) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    unavailable: list[str] = []
+    for kind in ("apt", "pip"):
+        diff = _diff_one(before.get(kind), after.get(kind))
+        if diff is None:
+            unavailable.append(kind)
+            out[kind] = []
+        else:
+            out[kind] = diff
+    if unavailable:
+        # 明講「這一類沒抓到」而不是靜靜回空陣列。空陣列的意思是「什麼都沒
+        # 裝」，跟「量不到」是完全不同的兩件事，混在一起會讓人以為套件沒裝成。
+        out["unavailable"] = unavailable
+    return out
+
+
 def main(argv: list[str]) -> int:
     signal.signal(signal.SIGTERM, _on_sigterm)
 
@@ -185,9 +289,12 @@ def main(argv: list[str]) -> int:
         "duration_sec": 0.0,
         "steps": [],
         "artifacts": [],
+        "installed": None,
+        "privileged": os.environ.get("SANDBOX_PRIVILEGED") == "1",
         "error": None,
     }
     started = time.monotonic()
+    before: dict[str, dict[str, str] | None] | None = None
 
     try:
         try:
@@ -209,6 +316,10 @@ def main(argv: list[str]) -> int:
 
         budget = float(task.get("timeout_sec", _DEFAULT_TASK_TIMEOUT))
         OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+        # 在跑任何步驟「之前」拍第一張快照。這一次的耗時算進總預算裡是刻意
+        # 的 —— 它跟步驟一樣會佔用容器的生命週期，藏起來只會讓逾時難以解釋。
+        before = _snapshot()
 
         overall = "success"
         for step in steps:
@@ -252,6 +363,14 @@ def main(argv: list[str]) -> int:
             result["artifacts"] = _collect_artifacts()
         except OSError as exc:
             result["error"] = f"{result.get('error') or ''} (產物列舉失敗：{exc})".strip()
+
+        # 第二張快照放在 finally 裡，逾時與 SIGTERM 的路徑也照樣拍得到 ——
+        # 「裝到一半被砍掉」正是最需要知道當時裝了什麼的情況。
+        if before is not None:
+            try:
+                result["installed"] = _diff_snapshots(before, _snapshot())
+            except Exception as exc:  # noqa: BLE001 — 快照壞掉不能蓋掉真正的結果
+                print(f"sandbox: 套件快照失敗：{exc!r}", file=sys.stderr)
 
         # 這是整支程式最重要的一次寫入。先寫暫存檔再 os.replace，避免
         # controller 讀到寫到一半的 JSON — 與晉升流程用的是同一個原子性原則。

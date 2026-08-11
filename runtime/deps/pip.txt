@@ -1,0 +1,19 @@
+# runtime 要額外安裝的 Python 套件（build 時安裝，執行期不裝任何東西）。
+#
+# 這個檔案由 `make deps-accept TASK=<進化任務 ID>` 維護，也可以自己手動編輯。
+# 改完要 git commit 再 `make build`（或 `make update`）才會生效。
+#
+# 格式就是一份 requirements.txt，交給 uv 處理。
+#
+# 為什麼這裡「有」釘版本，跟 apt.txt 相反：PyPI 不刪舊版本，釘死不會讓 build
+# 在幾週後憑空壞掉。而且沙箱驗過的就是那個版本，換一個版本等於沒驗過。
+#
+# 這些套件「不會」裝進 /opt/hermes/.venv。上游那個 venv 是封存的（root 所有、
+# 對 agent 唯讀、沒有 pip），動它會讓 make update 換上游版本時留下一堆殘骸。
+# 改成裝進 /opt/extra/site-packages，再由 PYTHONPATH 掛上去 —— 見
+# runtime/Dockerfile。代價是 PYTHONPATH 的優先序高於 venv 的 site-packages，
+# 所以這裡出現一個上游已經有的套件，會把 hermes 自己用的那份蓋掉。
+# `make deps-accept` 會擋下撞名的套件，`make verify` 會再驗一次。
+#
+# 例：
+#   pandas==2.3.1

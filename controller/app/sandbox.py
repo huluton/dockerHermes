@@ -48,6 +48,26 @@ _MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 # 容器日誌保留的位元組上限。
 _MAX_LOG_BYTES = 256 * 1024
 
+# 特權安裝模式（privileged_install）下補回來的 capability。
+#
+# 沙箱平常以 uid 10001 + cap_drop ALL 執行，那個組合下 `apt-get install` 一定
+# 失敗 —— dpkg 要設定檔案的擁有者與權限位元，apt 下載階段還要 setuid 到 _apt。
+# 實測：cap_drop ALL 之下連 apt-get update 都做不完整（後續安裝報
+# 「E: Unable to locate package」），補上這六個之後 apt install 正常。
+#
+# 刻意「沒有」放行的是 SYS_ADMIN（mount / remount）、NET_ADMIN、SYS_PTRACE、
+# MKNOD、SYS_MODULE、SYS_CHROOT —— 裝套件不需要它們，而逃逸相關的手法幾乎
+# 都繞著那一批打轉。no-new-privileges、記憶體/pids/逾時上限、以及「跑完強制
+# 移除」在特權模式下完全不變。
+_PRIVILEGED_INSTALL_CAPS = [
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "FSETID",
+    "SETGID",
+    "SETUID",
+]
+
 
 @dataclass
 class SandboxOutcome:
@@ -123,8 +143,11 @@ def _extract_tar(stream: Any, *, strip_prefix: str = "") -> dict[str, bytes]:
     return out
 
 
-def _sandbox_limits() -> dict[str, Any]:
+def _sandbox_limits(*, privileged: bool = False) -> dict[str, Any]:
     """沙箱容器的安全與資源設定。
+
+    ``privileged=True`` 只做兩件事：以 root 執行，並補回
+    ``_PRIVILEGED_INSTALL_CAPS`` 那六個 capability。其餘每一項限制都原封不動。
 
     回傳的是一組要展開給 ``client.containers.create()`` 的 kwargs，而不是一個
     已經組好的 HostConfig。高階 API 會自己從這些 kwargs 組出 HostConfig，
@@ -133,7 +156,7 @@ def _sandbox_limits() -> dict[str, Any]:
     得改用 ``client.api.create_container()`` 這條低階路徑，但那樣就拿不到
     Container 物件，後面的 put_archive / wait / logs / remove 全都要重寫。
     """
-    return dict(
+    limits = dict(
         # 明確指定網路，不呼叫 network inspect —— proxy 的 NETWORKS=0 會擋掉。
         network_mode=settings.sandbox_network,
         # 資源上限。沙箱跑的是自我進化產生的程式碼，無界的迴圈與記憶體暴衝
@@ -158,6 +181,14 @@ def _sandbox_limits() -> dict[str, Any]:
         restart_policy={"Name": "no"},
     )
 
+    if privileged:
+        # cap_drop=["ALL"] 仍然留著 —— Docker 先套 drop 再套 add，所以最終
+        # 生效的就只有下面這幾個，而不是「預設集再加上這幾個」。
+        limits["user"] = "0:0"
+        limits["cap_add"] = list(_PRIVILEGED_INSTALL_CAPS)
+
+    return limits
+
 
 def run_task(
     client: docker.DockerClient,
@@ -165,11 +196,15 @@ def run_task(
     task_spec: dict[str, Any],
     *,
     on_container_created: Any = None,
+    privileged: bool = False,
 ) -> SandboxOutcome:
     """在一個全新的短暫容器裡執行進化任務。
 
     ``on_container_created`` 會在容器 ID 出現時立刻被呼叫，讓生命週期管理端
     能把它登記進「進行中」集合，避免回收器把一個剛出生的容器誤認成孤兒。
+
+    ``privileged`` 讓這一次的沙箱能用 apt 裝系統套件，代價與界線見
+    ``_PRIVILEGED_INSTALL_CAPS`` 的註解。呼叫端負責確認營運層允許這件事。
     """
     outcome = SandboxOutcome()
     started = time.monotonic()
@@ -187,11 +222,17 @@ def run_task(
                 labels={
                     **settings.sandbox_label,
                     "hermes.task": task_id,
+                    # 讓 `docker ps --format '{{.Label "hermes.privileged"}}'`
+                    # 一眼看得出哪些沙箱是以特權模式跑的。
+                    "hermes.privileged": "1" if privileged else "0",
                 },
-                **_sandbox_limits(),
+                **_sandbox_limits(privileged=privileged),
                 # 不對外開任何埠，也不繼承 controller 的環境變數。沙箱能拿到
                 # 的環境變數只有映像內建的，加上 task.json 裡明確指定的。
-                environment={"SANDBOX_WORK_DIR": _WORK_DIR},
+                environment={
+                    "SANDBOX_WORK_DIR": _WORK_DIR,
+                    "SANDBOX_PRIVILEGED": "1" if privileged else "0",
+                },
                 working_dir=_WORK_DIR,
                 network_disabled=False,
                 detach=True,

@@ -19,6 +19,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
+from . import deps as deps_mod
 from . import promote as promote_mod
 from .config import settings
 from .docker_client import DockerUnavailable, build_client, check_access
@@ -56,8 +57,15 @@ async def lifespan(app: FastAPI):  # noqa: ANN201, ARG001
 
     # 兩個目錄都必須在第一次晉升之前就存在。它們是掛載點，正常情況下 Docker
     # 已經建好了 —— 這裡只是讓「沒掛卷的手動除錯」也能跑起來。
-    for directory in (settings.versions_dir, settings.live_dir):
+    for directory in (settings.versions_dir, settings.live_dir, settings.deps_dir):
         directory.mkdir(parents=True, exist_ok=True)
+
+    if settings.sandbox_allow_privileged:
+        log.warning(
+            "SANDBOX_ALLOW_PRIVILEGED_INSTALL=1 —— 任務可以要求以 root 起沙箱"
+            "（apt 裝得動系統套件）。沙箱依然是短暫容器、跑完強制移除，且只補回"
+            "六個檔案權限相關的 capability。"
+        )
 
     _engine = EvolutionEngine(client, settings)
     _engine.start()
@@ -95,6 +103,21 @@ class EvolveRequest(BaseModel):
     steps: list[Step] = Field(..., min_length=1, max_length=20)
     env: dict[str, str] = Field(default_factory=dict)
     timeout_sec: int = Field(default=900, ge=1, le=7200)
+
+    privileged_install: bool = Field(
+        default=False,
+        description=(
+            "以 root + 六個檔案權限相關的 capability 起沙箱，讓 apt-get install "
+            "能用。需要營運端先在 .env 設 SANDBOX_ALLOW_PRIVILEGED_INSTALL=1。"
+        ),
+    )
+    expect_artifacts: bool = Field(
+        default=True,
+        description=(
+            "任務是否應該在 /work/out 產出技能檔案。相依性探測任務（只想在沙箱裡"
+            "試裝套件、確認裝得起來）設 false，否則會以「沒有產物」判定失敗。"
+        ),
+    )
 
     @field_validator("skill")
     @classmethod
@@ -159,6 +182,11 @@ def status() -> dict[str, Any]:
             "cpus": settings.sandbox_cpus,
             "active": eng.active_count(),
             "max_concurrent": settings.max_concurrent_tasks,
+            "allow_privileged_install": settings.sandbox_allow_privileged,
+        },
+        "deps": {
+            "dir": str(settings.deps_dir),
+            "pending": len(deps_mod.list_pending(settings.deps_dir)),
         },
         "scanner": {
             "enforcing": settings.scanner_enforce,
@@ -183,13 +211,31 @@ def evolve(request: EvolveRequest) -> dict[str, Any]:
     可能耗時數分鐘 —— 用 GET /tasks/{id} 追蹤進度。
     """
     eng = engine()
+
+    if request.privileged_install and not settings.sandbox_allow_privileged:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "這套 stack 沒有開放特權安裝模式。要允許沙箱用 apt 裝系統套件，"
+                "在 .env 設 SANDBOX_ALLOW_PRIVILEGED_INSTALL=1 再重啟 controller。"
+                "（只影響短暫的沙箱容器；runtime 永遠不會拿到 root。）"
+            ),
+        )
+
     spec = {
         "steps": [s.model_dump() for s in request.steps],
         "env": request.env,
         "timeout_sec": request.timeout_sec,
+        "privileged_install": request.privileged_install,
+        "expect_artifacts": request.expect_artifacts,
     }
     task_id = eng.submit(request.skill, spec)
-    return {"task_id": task_id, "status": "queued", "skill": request.skill}
+    return {
+        "task_id": task_id,
+        "status": "queued",
+        "skill": request.skill,
+        "privileged_install": request.privileged_install,
+    }
 
 
 @app.get("/tasks")
@@ -207,6 +253,52 @@ def get_task(task_id: str) -> dict[str, Any]:
     if task is None:
         raise HTTPException(status_code=404, detail=f"找不到任務 {task_id}")
     return task
+
+
+@app.get("/deps/pending")
+def list_pending_deps() -> dict[str, Any]:
+    """列出「沙箱裝過、還沒決定要不要進 runtime」的套件清單。
+
+    這個端點只是把 hermes-deps 卷裡的內容讀出來給人看。真正把套件併進
+    runtime/deps/*.txt 的動作發生在宿主機上（`make deps-accept`），controller
+    沒有、也不該有那個能力。
+    """
+    pending = deps_mod.list_pending(settings.deps_dir)
+    return {"count": len(pending), "pending": pending}
+
+
+@app.get("/deps/pending/{task_id}")
+def get_pending_deps(task_id: str) -> dict[str, Any]:
+    try:
+        entry = deps_mod.get_pending(settings.deps_dir, task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"沒有 {task_id} 的待審依賴清單")
+    return entry
+
+
+@app.post("/deps/pending/{task_id}/resolve")
+def resolve_pending_deps(
+    task_id: str,
+    outcome: Literal["accepted", "rejected"] = Query(
+        ..., description="accepted 由 make deps-accept 在併入檔案之後回報；rejected 是否決"
+    ),
+) -> dict[str, Any]:
+    """把一份待審清單從 pending/ 移走，移到 accepted/ 或 rejected/。
+
+    ⚠️ ``outcome=accepted`` **不代表 controller 做了任何事**。真正把套件寫進
+    runtime/deps/*.txt 的是宿主機上的 `make deps-accept`；這個端點只負責在那件事
+    做完之後，把清單從待審佇列裡拿掉。controller 沒有能力改 runtime 的建置來源，
+    這是刻意的設計，不是還沒實作。
+    """
+    try:
+        moved = deps_mod.resolve(settings.deps_dir, task_id, outcome=outcome)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not moved:
+        raise HTTPException(status_code=404, detail=f"沒有 {task_id} 的待審依賴清單")
+    return {"task_id": task_id, "outcome": outcome}
 
 
 @app.get("/skills")

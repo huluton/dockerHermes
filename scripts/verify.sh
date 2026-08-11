@@ -483,7 +483,89 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-head_ "9. 端到端進化（FULL=1 才跑）"
+head_ "9. 額外依賴（沙箱驗過 → 人工確認 → 進 runtime）"
+# ---------------------------------------------------------------------------
+# 這一段驗的是「runtime/deps/*.txt 寫的東西，在跑著的容器裡真的存在」。
+# 兩份清單是 build 時才會用到的輸入，改完沒有 make build 的話 git 是乾淨的、
+# 容器卻是舊的 —— 那種落差不會有任何錯誤訊息，只會在 agent 用到那個套件時
+# 才炸開。這裡就是要把它變成一行紅字。
+APT_LIST="$(sed 's/#.*//' runtime/deps/apt.txt 2>/dev/null | tr -s '[:space:]' '\n' | grep -v '^$' || true)"
+PIP_LIST="$(sed 's/#.*//' runtime/deps/pip.txt 2>/dev/null \
+    | tr -d '[:blank:]' | grep -v '^$' | sed 's/[<>=!~[].*//' || true)"
+
+if [ -z "$APT_LIST" ]; then
+    ok "apt.txt 沒有額外套件（runtime 就是上游映像加設定）"
+else
+    missing=""
+    for p in $APT_LIST; do
+        in_runtime "dpkg -s '$p' 2>/dev/null | grep -q '^Status:.*installed'" \
+            || missing="$missing $p"
+    done
+    if [ -z "$missing" ]; then
+        ok "apt.txt 的 $(printf '%s' "$APT_LIST" | wc -w | tr -d ' ') 個套件都裝在 runtime 裡"
+    else
+        bad "apt.txt 有套件不在執行中的 runtime 裡：${missing# }" \
+            "清單改過但映像沒重建。修：make build && make up"
+    fi
+fi
+
+if [ -z "$PIP_LIST" ]; then
+    ok "pip.txt 沒有額外套件"
+else
+    # dist-info 的目錄名是正規化過的（PEP 503：大寫轉小寫，. _ 一律轉 -），
+    # 所以兩邊都做同一套處理再比。
+    installed="$(in_runtime "ls /opt/extra/site-packages 2>/dev/null \
+        | sed -n 's/\(.*\)-[0-9][^-]*\.dist-info\$/\1/p' \
+        | tr '[:upper:]_.' '[:lower:]--' | sort -u" | tr -d '\r')"
+    missing=""
+    for p in $PIP_LIST; do
+        norm="$(printf '%s' "$p" | tr '[:upper:]_.' '[:lower:]--')"
+        printf '%s\n' "$installed" | grep -qxF "$norm" || missing="$missing $p"
+    done
+    if [ -z "$missing" ]; then
+        ok "pip.txt 的套件都在 /opt/extra/site-packages 裡"
+    else
+        bad "pip.txt 有套件不在 /opt/extra/site-packages：${missing# }" \
+            "清單改過但映像沒重建。修：make build && make up"
+    fi
+
+    # 撞名 = 靜默故障。PYTHONPATH 排在 venv 的 site-packages 前面，所以同名
+    # 套件會把 hermes 自己相依的那一份蓋掉，而且一切照常啟動 —— 只有某個角落
+    # 的行為悄悄變了。make deps-accept 會擋一次，這裡是第二道。
+    venv="$(in_runtime "ls /opt/hermes/.venv/lib/python*/site-packages 2>/dev/null \
+        | sed -n 's/\(.*\)-[0-9][^-]*\.dist-info\$/\1/p' \
+        | tr '[:upper:]_.' '[:lower:]--' | sort -u" | tr -d '\r')"
+    clash=""
+    for p in $PIP_LIST; do
+        norm="$(printf '%s' "$p" | tr '[:upper:]_.' '[:lower:]--')"
+        printf '%s\n' "$venv" | grep -qxF "$norm" && clash="$clash $p"
+    done
+    if [ -z "$clash" ]; then
+        ok "沒有額外套件蓋掉上游 venv 裡的同名套件"
+    else
+        bad "這些額外套件與上游 venv 撞名：${clash# }" \
+            "PYTHONPATH 優先序較高，hermes 會 import 到我們裝的那一份。從 pip.txt 拿掉它們。"
+    fi
+fi
+
+# 「build 時裝」與「執行期裝」的分界。前面兩項通過只代表清單有生效，不代表
+# agent 拿不到安裝能力 —— 這一項才是。
+out="$(in_runtime 'id -u hermes; command -v sudo || echo NO_SUDO' | tr -d '\r')"
+if printf '%s' "$out" | grep -q NO_SUDO; then
+    ok "runtime 裡沒有 sudo"
+else
+    bad "runtime 裡有 sudo" "agent 在執行期就能改系統，build 時安裝的界線失效"
+fi
+
+out="$(in_runtime 'su -s /bin/sh hermes -c "touch /usr/.verify-probe" 2>&1; rm -f /usr/.verify-probe')"
+if printf '%s' "$out" | grep -qi 'denied\|read-only'; then
+    ok "agent 使用者寫不進 /usr"
+else
+    soft "agent 對 /usr 的寫入沒有被明確擋下" "$(printf '%s' "$out" | head -1)"
+fi
+
+# ---------------------------------------------------------------------------
+head_ "10. 端到端進化（FULL=1 才跑）"
 # ---------------------------------------------------------------------------
 if [ "$FULL" != "1" ]; then
     printf '  （跳過。要跑真正的進化任務：make verify FULL=1）\n'

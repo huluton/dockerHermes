@@ -9,6 +9,14 @@
 # 候選技能要編譯 wheel、拉依賴、跑測試，全部發生在這裡；跑完連容器一起丟掉，
 # 所以再髒也不會污染正式環境。
 #
+# 「自由」有一格例外要講清楚：預設情況下容器是 USER sandbox + cap_drop: ALL，
+# pip 裝得動（裝進自己 home 底下的 venv），apt **裝不動** —— dpkg 改不了
+# /var/lib/dpkg，而它報出來的訊息是「Unable to locate package」，看起來像套件
+# 不存在。要裝系統套件的任務得在 /evolve 請求裡帶 privileged_install: true，
+# 那會讓 controller 改用 root + 六個檔案權限相關的 capability 起這個容器
+# （見 controller/app/sandbox.py 的 _PRIVILEGED_INSTALL_CAPS），而且營運端要先
+# 在 .env 開 SANDBOX_ALLOW_PRIVILEGED_INSTALL=1。
+#
 # python:3.13-slim 官方映像同時提供 linux/amd64 與 linux/arm64。
 FROM python:3.13-slim
 

@@ -65,7 +65,11 @@ openssl rand -base64 24       # 產一組
 ├── docker-compose.yml         四個服務、三個網路、四個卷
 ├── .env.example               所有可調參數
 ├── Makefile                   操作入口
-├── runtime/Dockerfile         FROM 上游官方映像；只做設定
+├── runtime/
+│   ├── Dockerfile             FROM 上游官方映像；只做設定
+│   └── deps/                  build 時要多裝的套件（人工確認過才會出現在這裡）
+│       ├── apt.txt            Debian 套件，不釘版本
+│       └── pip.txt            Python 套件，釘版本，裝進 /opt/extra 而非 venv
 ├── mcp-fs/                    remote MCP filesystem server（外部資料夾只掛在這裡）
 │   ├── Dockerfile             filesystem server + supergateway，版本都釘死
 │   └── entrypoint.sh          MCP_FS_ROOTS → 允許清單 → Streamable HTTP
@@ -80,14 +84,18 @@ openssl rand -base64 24       # 產一組
 │   │   ├── sandbox.py         每個任務一個容器：建立、執行、強制移除
 │   │   ├── scanner.py         AST 靜態掃描
 │   │   ├── promote.py         原子性晉升與回滾
+│   │   ├── deps.py            沙箱裝了什麼 → 消毒 → 待審清單
 │   │   └── lifecycle.py       串起整條流程，任務狀態存 SQLite
-│   └── tests/                 scanner / promote / sandbox 設定的單元測試
-├── sandbox/                   唯一允許自由 pip install 的地方
+│   └── tests/                 scanner / promote / sandbox / deps 的單元測試
+├── sandbox/                   唯一允許自由安裝套件的地方
 ├── examples/
 │   ├── config.vllm.yaml       接地端 vLLM 的設定範本
 │   ├── evolve.hello-skill.json     最小可跑的進化任務
+│   ├── evolve.deps-postgres.json   依賴探測任務（在沙箱裡試裝系統套件）
 │   └── evolve.rejected-skill.json  刻意該被掃描器擋下的任務
-└── scripts/verify.sh          make verify 的實作
+└── scripts/
+    ├── verify.sh              make verify 的實作
+    └── deps.sh                make deps-* 的實作（人工閘門，跑在宿主機上）
 ```
 
 ---
@@ -532,12 +540,15 @@ POST /evolve
     │
     ▼
 起一個沙箱容器（CapDrop ALL、資源上限、逾時）
-    │
+    │            privileged_install 的任務改成 root + 六個檔案權限 capability
     ▼
 依序執行 steps；技能檔案寫到 /work/out/
     │
     ▼
 用 get_archive 把 /work/out/ 收回 controller（沒有共用卷）
+    │
+    ▼
+沙箱裝了什麼 → 消毒 → 寫成待審清單（見「讓 agent 自由裝套件」）
     │
     ▼
 AST 靜態掃描 —— 沒過就到此為止，線上狀態完全沒被碰過
@@ -592,6 +603,9 @@ make evolve REQ=examples/evolve.rejected-skill.json
 - `out/SKILL.md` 是必要的 —— 這是上游 hermes 的技能格式規定。
 - `env` 不能覆寫 `PATH`、`PYTHONPATH`、`LD_PRELOAD`、`LD_LIBRARY_PATH`、
   `VIRTUAL_ENV`，那些會改變「什麼程式碼會被執行」。
+- `privileged_install`（預設 `false`）讓沙箱以 root 起，`apt-get install` 才裝得動；
+  `expect_artifacts`（預設 `true`）設成 `false` 代表這個任務不產技能。兩個都是
+  下一節那條路徑在用的，一般任務用不到。
 
 Controller 的 API（`hermes-net` 內的 `http://hermes-controller:9200`，
 **刻意不對宿主機發佈**）：
@@ -606,6 +620,9 @@ Controller 的 API（`hermes-net` 內的 `http://hermes-controller:9200`，
 | GET | `/tasks/{id}` | 單一任務的完整記錄 |
 | GET | `/skills` | 線上技能與可用版本 |
 | POST | `/skills/{skill}/rollback` | 回滾到指定版本 |
+| GET | `/deps/pending` | 沙箱裝過、還沒決定要不要進 runtime 的套件清單 |
+| GET | `/deps/pending/{id}` | 單一份待審清單 |
+| POST | `/deps/pending/{id}/resolve?outcome=` | 把清單移到 `accepted/` 或 `rejected/` |
 
 這個 API 沒有身分驗證 —— **網路拓撲就是它的邊界**。它只在 `hermes-net` 上，
 沒有發佈任何埠。要從宿主機打就用 `docker compose exec`（`make` 的那些目標就是
@@ -619,6 +636,81 @@ Controller 的 API（`hermes-net` 內的 `http://hermes-controller:9200`，
 被誤殺的話，先確認那真的是誤報 —— `controller/tests/test_scanner.py` 裡有一個
 `test_ordinary_skill_code_is_clean`，就是為了守住「不能太吵」這條線。一個到處
 誤報的掃描器，最後的下場是被人設成 `SCANNER_ENFORCE=0`，等於整層防禦消失。
+
+### 讓 agent 自由裝套件，確認後再進 runtime
+
+沙箱可以裝任何東西，但沙箱是短暫容器 —— 任務一結束，裝出來的檔案跟著可寫層
+一起消失。所以「搬到 runtime」實際上搬得動的**只有清單**，而不是檔案。
+
+```
+沙箱裡 apt/pip 裝東西
+    │  run_task.py 在任務前後各拍一次套件快照
+    ▼
+result.json 的 installed 欄位
+    │  controller 用白名單正則消毒（名稱與版本）
+    ▼
+hermes-deps 卷的 pending/            ← controller 到此為止
+    │  make deps-accept（跑在宿主機上）
+    ▼
+runtime/deps/apt.txt、pip.txt
+    │  git commit                     ← 「確認 ok」就是這一步
+    ▼
+make build —— 套件在 build 時裝進映像
+```
+
+完整走一遍：
+
+```bash
+# 0. 一次性：允許任務要求特權沙箱（沒有它，apt 在 cap_drop: ALL 下裝不動）
+echo 'SANDBOX_ALLOW_PRIVILEGED_INSTALL=1' >> .env && make up
+
+make evolve REQ=examples/evolve.deps-postgres.json
+make task ID=evo-...              # 等 status=succeeded
+
+make deps-list                    # 有哪幾份待審
+make deps-show TASK=evo-...       # 完整清單（含被連帶拉進來的相依套件）
+make deps-accept TASK=evo-...     # 併進 runtime/deps/*.txt
+# 不要的話：make deps-reject TASK=evo-...（檔案移到 rejected/ 保留，不刪除）
+
+git diff runtime/deps/            # ← 真正的審查在這裡
+git commit -am 'deps: postgresql-17'
+make build && make up
+make verify                       # 第 9 節確認套件真的在跑著的容器裡
+```
+
+幾個刻意的設計：
+
+- **controller 不會改 runtime 的建置來源。** 它已經是整套架構裡權限最高的一環
+  （能建容器、能把程式碼晉升上線）。再給它「決定正式映像裝什麼」的能力，
+  自我進化的迴圈就完全閉合，中間沒有任何人類檢查點。所以 `make deps-accept`
+  跑在宿主機上，寫出來的檔案屬於你，由 git 記錄。
+- **`privileged_install` 是雙開關。** 任務要在請求裡明講，營運端也要在 `.env`
+  開 `SANDBOX_ALLOW_PRIVILEGED_INSTALL=1`，缺一個就回 403。/evolve 沒有身分
+  驗證（邊界是網路拓撲），所以「能不能用 root」不能只由請求內容決定。
+  開了之後受影響的也只有帶旗標的那些任務 —— 其餘照樣是 uid 10001 + `cap_drop: ALL`。
+  沙箱拿到的 root 依然沒有 `CAP_SYS_ADMIN`、依然掛著 `no-new-privileges`、
+  依然吃記憶體與逾時上限、跑完一定被強制移除。
+- **套件名要過白名單正則兩次**（controller 寫檔前、`deps.sh` 併檔前）。那串字
+  最後會變成 `apt-get install` 的參數，而它的源頭是沙箱裡執行的任意程式碼。
+  被擋掉的項目一定會列出原因，不會靜靜消失。
+- **apt 不釘版本、pip 釘版本。** Debian 的 mirror 會在點版本更新後把舊版從 pool
+  移除，釘死會讓映像在幾週後突然建不起來，而那個失敗跟你當下在改的東西毫無
+  關係；沙箱驗到的版本改寫成同一行的註解留存。PyPI 不刪舊版，所以 pip 那邊
+  釘死沒有這個問題，而且沙箱驗過的就是那個版本。
+- **pip 套件裝進 `/opt/extra/site-packages`，不裝進 `/opt/hermes/.venv`。**
+  上游那個 venv 是封存的（root 所有、對 agent 唯讀、連 pip 模組都沒有），動它
+  會在 `make update` 換上游映像時留下難追的殘骸。代價是 `PYTHONPATH` 的優先序
+  高於 venv 的 `site-packages`，所以裝一個上游已經有的套件會把 hermes 自己用的
+  那份**悄悄蓋掉** —— `make deps-accept` 會擋，`make verify` 再驗一次。
+- **「絕不在 Runtime 容器內執行 pip install」這條原則沒有被放寬。** 安裝發生在
+  build 時。跑起來的 runtime 裡，agent 依然是 uid 10000、沒有 sudo、`/usr` 寫不
+  進去。它能影響的只有「下一次 build 裝什麼」，而那中間隔著人工審查與 git commit。
+
+順帶一提，agent 其實不必等這條路徑就能在 runtime 裡用到額外的東西 —— 它可以
+`dpkg-deb -x` 把 `.deb` 解到 `/opt/data` 底下，配 `LD_LIBRARY_PATH` 執行。那樣
+裝出來的東西活在資料卷裡，`make update` 不會清掉，也不需要任何權限。缺點是它
+不在 git 裡、不會出現在 `make verify`，換一台機器就沒了。要長期依賴的東西還是
+走上面那條路。
 
 ---
 

@@ -317,6 +317,33 @@ status: ## controller 的完整狀態
 	@$(COMPOSE) exec -T hermes-controller curl -sS http://127.0.0.1:9200/status
 	@echo
 
+# ---------------------------------------------------------------------------
+# 依賴晉升（沙箱裡驗過的套件 → runtime 的建置清單）
+# ---------------------------------------------------------------------------
+# 這四個目標刻意「不」透過 controller 改檔案。controller 已經能建容器、能把
+# 程式碼晉升到線上技能目錄；再讓它決定正式映像裝什麼，自我進化的迴圈就閉合了。
+# 真正的閘門是你在宿主機上跑 deps-accept、看 git diff、然後 commit。
+# 完整流程見 README 的「讓 agent 自由裝套件，確認後再進 runtime」。
+
+.PHONY: deps-list
+deps-list: ## 列出沙箱裝過、還沒決定要不要進 runtime 的套件清單
+	@bash scripts/deps.sh list
+
+.PHONY: deps-show
+deps-show: ## 看某一份待審清單的完整內容。用法：make deps-show TASK=evo-...
+	@test -n "$(TASK)" || { echo "用法：make deps-show TASK=<task-id>"; exit 1; }
+	@bash scripts/deps.sh show "$(TASK)"
+
+.PHONY: deps-accept
+deps-accept: ## 把清單併進 runtime/deps/*.txt（之後還要 git commit + make build）
+	@test -n "$(TASK)" || { echo "用法：make deps-accept TASK=<task-id>"; exit 1; }
+	@bash scripts/deps.sh accept "$(TASK)"
+
+.PHONY: deps-reject
+deps-reject: ## 否決一份待審清單（檔案移到 rejected/ 保留，不刪除）
+	@test -n "$(TASK)" || { echo "用法：make deps-reject TASK=<task-id>"; exit 1; }
+	@bash scripts/deps.sh reject "$(TASK)"
+
 .PHONY: reap
 reap: ## 強制移除這個實例殘留的沙箱容器
 	@ids=$$(docker ps -aq $(SANDBOX_FILTER)); \

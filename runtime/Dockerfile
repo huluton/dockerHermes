@@ -79,6 +79,62 @@ RUN mkdir -p /opt/data/skills/evolved /opt/data/skill-versions \
     && chown -R 10000:10000 /opt/data/skills /opt/data/skill-versions
 
 # ---------------------------------------------------------------------------
+# 額外依賴（沙箱裡驗過、經人工確認後才進得來的東西）
+# ---------------------------------------------------------------------------
+# 這兩個清單是「讓 agent 自由裝套件」那條路徑的終點：agent 在短暫的
+# hermes-sandbox 容器裡愛裝什麼裝什麼 → 沙箱記下裝了什麼 → controller 寫成待審
+# 清單 → 人在宿主機上 `make deps-accept` 併進這裡 → git commit → make build。
+#
+# 關鍵在於安裝發生在 **build 時**，不是執行期。「絕不在 Runtime 容器內執行
+# pip install」這條原則沒有被放寬：agent 在跑起來的容器裡依然是 uid 10000、
+# 沒有 sudo、/usr 唯讀，裝不了任何東西。它能影響的只有「下一次 build 裝什麼」，
+# 而那中間隔著一次人工審查與一次 git commit。
+#
+# 為什麼用 COPY deps/ 而不是 COPY deps/apt.txt deps/pip.txt：整個目錄複製進來，
+# 映像裡就留著一份「這個映像到底多裝了什麼」的自我描述，事後在容器裡
+# `cat /opt/deps/apt.txt` 就能對答案，不必回頭翻 repo。
+COPY deps/ /opt/deps/
+
+# apt 套件。清單全是註解或空的時候整層是 no-op（連 apt-get update 都不會跑）。
+#
+# sed 把 # 之後的內容砍掉，讓「套件名 # 沙箱驗過的版本」這種寫法能用。
+RUN set -eu; \
+    pkgs="$(sed 's/#.*//' /opt/deps/apt.txt | tr -s '[:space:]' '\n' | grep -v '^$' || true)"; \
+    if [ -n "${pkgs}" ]; then \
+        echo "[deps] 安裝 apt 套件：${pkgs}"; \
+        apt-get update; \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${pkgs}; \
+        rm -rf /var/lib/apt/lists/*; \
+    else \
+        echo "[deps] apt.txt 沒有套件，跳過"; \
+    fi
+
+# Python 套件。刻意「不」裝進 /opt/hermes/.venv —— 那個 venv 是上游封存的
+# （root 所有、對 agent 唯讀、連 pip 模組都沒有），裝進去會在 make update
+# 換掉上游映像時留下難以追蹤的殘骸。改成獨立目錄 + PYTHONPATH。
+#
+# 用 uv 而不是 pip：上游映像的 venv 裡沒有 pip，但 /usr/local/bin/uv 有。
+# --python 指向 venv 的直譯器，讓相依解析對到正確的 Python 版本與平台標記。
+RUN set -eu; \
+    mkdir -p /opt/extra/site-packages; \
+    if grep -qvE '^[[:space:]]*(#|$)' /opt/deps/pip.txt 2>/dev/null; then \
+        echo "[deps] 安裝 pip 套件："; \
+        grep -vE '^[[:space:]]*(#|$)' /opt/deps/pip.txt; \
+        uv pip install \
+            --python /opt/hermes/.venv/bin/python \
+            --target /opt/extra/site-packages \
+            -r /opt/deps/pip.txt; \
+    else \
+        echo "[deps] pip.txt 沒有套件，跳過"; \
+    fi; \
+    chmod -R a+rX /opt/extra
+
+# 目錄空的時候這行是無害的 no-op。設在這裡而不是條件式設定，是為了讓
+# 「有沒有額外套件」不會改變映像的環境變數形狀 —— 兩種情況下的容器長得一樣，
+# 少一個排查時的變因。
+ENV PYTHONPATH=/opt/extra/site-packages
+
+# ---------------------------------------------------------------------------
 # 健康檢查
 # ---------------------------------------------------------------------------
 # 打 /api/status。這是上游在 dashboard_auth/public_paths.py 裡明確標為

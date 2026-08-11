@@ -21,6 +21,7 @@ APP_GID="${HERMES_GID:-10000}"
 LIVE_SKILLS_DIR="${LIVE_SKILLS_DIR:-/opt/data/skills/evolved}"
 SKILL_VERSIONS_DIR="${SKILL_VERSIONS_DIR:-/opt/data/skill-versions}"
 STATE_DIR="${STATE_DIR:-/state}"
+DEPS_DIR="${DEPS_DIR:-/deps}"
 BIND_HOST="${CONTROLLER_HOST:-0.0.0.0}"
 BIND_PORT="${CONTROLLER_PORT:-9200}"
 
@@ -38,7 +39,7 @@ die() {
 # 只在 root 身分下做。有人用 `user:` 覆寫 compose 設定、或在 rootless Docker
 # 下跑的時候，這一段會整段跳過 —— 那種情況下卷的擁有者本來就已經對了。
 if [ "$(id -u)" = "0" ]; then
-    for d in "${LIVE_SKILLS_DIR}" "${SKILL_VERSIONS_DIR}" "${STATE_DIR}"; do
+    for d in "${LIVE_SKILLS_DIR}" "${SKILL_VERSIONS_DIR}" "${STATE_DIR}" "${DEPS_DIR}"; do
         mkdir -p "${d}" || die "無法建立 ${d}"
 
         # 只有在擁有者不對的時候才 chown。技能卷累積數百個版本之後，

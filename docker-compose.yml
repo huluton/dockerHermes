@@ -80,6 +80,14 @@ volumes:
   hermes-state:
     name: hermes-${INSTANCE:-default}-state
 
+  # 待審依賴清單：沙箱在進化任務裡裝了什麼套件。
+  #
+  # 刻意「沒有」掛進 runtime —— runtime 只吃 build 時烘進映像的 /opt/deps，
+  # 這個卷是給宿主機上的人看的（make deps-list / make deps-accept）。
+  # 兩者之間沒有任何自動化的路徑，中間那一步是 git commit。
+  hermes-deps:
+    name: hermes-${INSTANCE:-default}-deps
+
 # ---------------------------------------------------------------------------
 # 服務
 # ---------------------------------------------------------------------------
@@ -332,6 +340,10 @@ services:
       # 任務資料庫。
       - hermes-state:/state
 
+      # 待審依賴清單。controller 只往 pending/ 寫，決定權在宿主機上的
+      # make deps-accept 手上。
+      - hermes-deps:/deps
+
       # 掃描政策。唯讀掛進來，改規則不用重建映像 —— 但也代表 controller
       # 自己改不了自己的安全政策。
       - ./controller/policy.yaml:/opt/controller/policy.yaml:ro
@@ -360,9 +372,16 @@ services:
       SANDBOX_PIDS_LIMIT: ${SANDBOX_PIDS_LIMIT:-512}
       MAX_CONCURRENT_TASKS: ${MAX_CONCURRENT_TASKS:-2}
 
+      # 允不允許任務要求「以 root 起沙箱」（讓 apt-get install 能用）。
+      # 預設 0。開了也只影響短暫的沙箱容器 —— runtime 永遠不會拿到 root，
+      # 那是「正式環境穩定」原則的底線。細節見 README 的
+      # 「讓 agent 自由裝套件，確認後再進 runtime」。
+      SANDBOX_ALLOW_PRIVILEGED_INSTALL: ${SANDBOX_ALLOW_PRIVILEGED_INSTALL:-0}
+
       LIVE_SKILLS_DIR: /opt/data/skills/evolved
       SKILL_VERSIONS_DIR: /opt/data/skill-versions
       STATE_DIR: /state
+      DEPS_DIR: /deps
       KEEP_VERSIONS: ${KEEP_VERSIONS:-5}
 
       SCANNER_POLICY_FILE: /opt/controller/policy.yaml

@@ -54,8 +54,8 @@ COPY --chmod=0755 entrypoint.sh /opt/controller/entrypoint.sh
 #
 # 這兩個技能路徑必須與 runtime 容器裡的一模一樣 —— 線上目錄裡放的是指向
 # 版本庫的 symlink，兩邊路徑不一致就會 dangling。
-RUN mkdir -p /opt/data/skills/evolved /opt/data/skill-versions /state \
-    && chown -R "${HERMES_UID}:${HERMES_GID}" /opt/data /state
+RUN mkdir -p /opt/data/skills/evolved /opt/data/skill-versions /state /deps \
+    && chown -R "${HERMES_UID}:${HERMES_GID}" /opt/data /state /deps
 
 # 這些預設值與 app/config.py 裡的一致。集中在 compose 覆寫，這裡只是讓映像
 # 在沒有任何環境變數的情況下也能自我描述。
@@ -64,6 +64,7 @@ ENV CONTROLLER_HOST=0.0.0.0 \
     LIVE_SKILLS_DIR=/opt/data/skills/evolved \
     SKILL_VERSIONS_DIR=/opt/data/skill-versions \
     STATE_DIR=/state \
+    DEPS_DIR=/deps \
     SCANNER_POLICY_FILE=/opt/controller/policy.yaml \
     DOCKER_HOST=tcp://docker-socket-proxy:2375
 
